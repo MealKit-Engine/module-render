@@ -1,6 +1,6 @@
-#include "aster/render/Mesh.h"
+#include "mealkit/render/Mesh.h"
 
-namespace aster::render {
+namespace mealkit::render {
 
 MeshData makeBox() {
     MeshData mesh;
@@ -32,4 +32,4 @@ MeshData makeBox() {
     return mesh;
 }
 
-} // namespace aster::render
+} // namespace mealkit::render

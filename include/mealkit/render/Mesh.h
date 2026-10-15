@@ -1,10 +1,10 @@
 #pragma once
 
-#include "aster/core/Math.h"
+#include "mealkit/core/Math.h"
 
 #include <vector>
 
-namespace aster::render {
+namespace mealkit::render {
 
 struct Vertex {
     Vec3 position;
@@ -21,4 +21,4 @@ struct MeshData {
 // 원점 중심, 한 변 1인 상자. 면마다 정점을 따로 둬서 법선이 각지게 나온다.
 MeshData makeBox();
 
-} // namespace aster::render
+} // namespace mealkit::render

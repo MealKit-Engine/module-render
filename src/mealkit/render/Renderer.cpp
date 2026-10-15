@@ -1,6 +1,6 @@
-#include "aster/render/Renderer.h"
+#include "mealkit/render/Renderer.h"
 
-#include "aster/core/Log.h"
+#include "mealkit/core/Log.h"
 
 #include <algorithm>
 #include <cstring>
@@ -22,7 +22,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-namespace aster::render {
+namespace mealkit::render {
 namespace {
 
 constexpr u32 kFramesInFlight = 2;
@@ -51,7 +51,7 @@ void checkHr(HRESULT hr, const char* expr, const char* file, int line) {
     HRESULT reason = S_OK;
     if (g_errorDevice && (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET))
         reason = g_errorDevice->GetDeviceRemovedReason();
-    ASTER_FATAL("D3D12 call failed (hr=0x%08X, device removed reason=0x%08X)\n%s\n%s:%d", static_cast<unsigned>(hr),
+    MEALKIT_FATAL("D3D12 call failed (hr=0x%08X, device removed reason=0x%08X)\n%s\n%s:%d", static_cast<unsigned>(hr),
                 static_cast<unsigned>(reason), expr, file, line);
 }
 #define HR(expr) checkHr((expr), #expr, __FILE__, __LINE__)
@@ -104,8 +104,8 @@ D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATE
 
 void __stdcall onDebugMessage(D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY severity, D3D12_MESSAGE_ID,
                               LPCSTR description, void*) {
-    if (severity <= D3D12_MESSAGE_SEVERITY_ERROR) ASTER_ERROR("[D3D12] %s", description);
-    else if (severity == D3D12_MESSAGE_SEVERITY_WARNING) ASTER_WARN("[D3D12] %s", description);
+    if (severity <= D3D12_MESSAGE_SEVERITY_ERROR) MEALKIT_ERROR("[D3D12] %s", description);
+    else if (severity == D3D12_MESSAGE_SEVERITY_WARNING) MEALKIT_WARN("[D3D12] %s", description);
 }
 
 struct GpuMesh {
@@ -262,7 +262,7 @@ struct Renderer::Impl {
 
         ComPtr<ID3DBlob> blob, error;
         if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error))) {
-            ASTER_FATAL("Root signature: %s",
+            MEALKIT_FATAL("Root signature: %s",
                         error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown error");
         }
         HR(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -373,8 +373,8 @@ struct Renderer::Impl {
                  SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
         }
         if (SUCCEEDED(co)) CoUninitialize();
-        if (ok) ASTER_INFO("Screenshot saved: %s (%ux%u)", capturePath.c_str(), w, h);
-        else ASTER_WARN("Screenshot failed: %s", capturePath.c_str());
+        if (ok) MEALKIT_INFO("Screenshot saved: %s (%ux%u)", capturePath.c_str(), w, h);
+        else MEALKIT_WARN("Screenshot failed: %s", capturePath.c_str());
     }
 };
 
@@ -393,18 +393,18 @@ bool Renderer::init(const RendererDesc& desc) {
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
             debug->EnableDebugLayer();
             factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
-            ASTER_INFO("D3D12 debug layer enabled");
+            MEALKIT_INFO("D3D12 debug layer enabled");
         } else {
-            ASTER_WARN("D3D12 debug layer unavailable (install the 'Graphics Tools' optional feature)");
+            MEALKIT_WARN("D3D12 debug layer unavailable (install the 'Graphics Tools' optional feature)");
         }
     }
 
     if (FAILED(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&m->factory)))) {
-        ASTER_ERROR("DXGI 1.6 is required (Windows 10 1803 or later)");
+        MEALKIT_ERROR("DXGI 1.6 is required (Windows 10 1803 or later)");
         return false;
     }
     if (!m->pickAdapter()) {
-        ASTER_ERROR("No Direct3D 12 capable GPU found");
+        MEALKIT_ERROR("No Direct3D 12 capable GPU found");
         return false;
     }
     HR(D3D12CreateDevice(m->adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m->device)));
@@ -418,14 +418,14 @@ bool Renderer::init(const RendererDesc& desc) {
     D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_0};
     if (FAILED(m->device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
         sm.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
-        ASTER_ERROR("Shader Model 6.0 is required (update the GPU driver)");
+        MEALKIT_ERROR("Shader Model 6.0 is required (update the GPU driver)");
         return false;
     }
 
     D3D12_FEATURE_DATA_ARCHITECTURE arch{};
     m->device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch));
     m->uma = arch.UMA != FALSE;
-    ASTER_INFO("GPU: %s | feature level %X | %s memory", m->adapterName.c_str(),
+    MEALKIT_INFO("GPU: %s | feature level %X | %s memory", m->adapterName.c_str(),
                static_cast<unsigned>(fl.MaxSupportedFeatureLevel), m->uma ? "unified (UMA)" : "dedicated");
 
     if (desc.debugLayer) {
@@ -525,7 +525,7 @@ void Renderer::resize(u32 width, u32 height) {
 
 MeshId Renderer::createMesh(const MeshData& data) {
     if (data.vertices.empty() || data.indices.empty()) {
-        ASTER_WARN("createMesh: empty mesh");
+        MEALKIT_WARN("createMesh: empty mesh");
         return 0;
     }
     GpuMesh mesh;
@@ -634,7 +634,7 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
     const D3D12_GPU_VIRTUAL_ADDRESS gpu = m->allocUpload(bytes, &cpu);
     if (!gpu) {
         if (!m->uploadOverflowWarned) {
-            ASTER_WARN("Upload ring full (%llu bytes requested); raise kUploadBytesPerFrame",
+            MEALKIT_WARN("Upload ring full (%llu bytes requested); raise kUploadBytesPerFrame",
                        static_cast<unsigned long long>(bytes));
             m->uploadOverflowWarned = true;
         }
@@ -757,4 +757,4 @@ const RenderStats& Renderer::stats() const {
     return m ? m->stats : empty;
 }
 
-} // namespace aster::render
+} // namespace mealkit::render

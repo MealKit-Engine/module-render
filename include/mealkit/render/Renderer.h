@@ -1,9 +1,9 @@
 #pragma once
 
-#include "aster/core/Math.h"
-#include "aster/render/Mesh.h"
+#include "mealkit/core/Math.h"
+#include "mealkit/render/Mesh.h"
 
-namespace aster::render {
+namespace mealkit::render {
 
 using MeshId = u32;
 
@@ -104,4 +104,4 @@ private:
     Impl* m = nullptr;
 };
 
-} // namespace aster::render
+} // namespace mealkit::render
