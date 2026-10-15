@@ -52,7 +52,7 @@ void checkHr(HRESULT hr, const char* expr, const char* file, int line) {
     if (g_errorDevice && (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET))
         reason = g_errorDevice->GetDeviceRemovedReason();
     MEALKIT_FATAL("D3D12 call failed (hr=0x%08X, device removed reason=0x%08X)\n%s\n%s:%d", static_cast<unsigned>(hr),
-                static_cast<unsigned>(reason), expr, file, line);
+                  static_cast<unsigned>(reason), expr, file, line);
 }
 #define HR(expr) checkHr((expr), #expr, __FILE__, __LINE__)
 
@@ -91,8 +91,7 @@ D3D12_RESOURCE_DESC bufferDesc(u64 size) {
     return d;
 }
 
-D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
-                                  D3D12_RESOURCE_STATES after) {
+D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = resource;
@@ -167,7 +166,7 @@ struct Renderer::Impl {
     RenderStats stats;
     std::string capturePath;
 #if defined(TRACY_ENABLE)
-    tracy::D3D12QueueCtx* tracyGpu = nullptr;          // GPU 시간 측정 (프로파일 빌드)
+    tracy::D3D12QueueCtx* tracyGpu = nullptr; // GPU 시간 측정 (프로파일 빌드)
     std::optional<tracy::D3D12ZoneScope> tracyFrameZone;
 #endif
 
@@ -204,7 +203,8 @@ struct Renderer::Impl {
             DXGI_ADAPTER_DESC1 desc;
             candidate->GetDesc1(&desc);
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-            if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
+            if (SUCCEEDED(
+                    D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
                 adapter = candidate;
                 adapterName = narrow(desc.Description);
                 return true;
@@ -223,8 +223,8 @@ struct Renderer::Impl {
         HR(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                            nullptr, IID_PPV_ARGS(&buffer)));
         ComPtr<ID3D12Resource> staging;
-        HR(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc,
-                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)));
+        HR(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                           nullptr, IID_PPV_ARGS(&staging)));
         void* mapped = nullptr;
         const D3D12_RANGE noRead{0, 0};
         HR(staging->Map(0, &noRead, &mapped));
@@ -234,8 +234,7 @@ struct Renderer::Impl {
         ComPtr<ID3D12CommandAllocator> allocator;
         HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
         ComPtr<ID3D12GraphicsCommandList> list;
-        HR(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                                     IID_PPV_ARGS(&list)));
+        HR(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
         // 버퍼는 COMMON에서 COPY_DEST로, 실행 후 다시 읽기 상태로 암묵적으로 승격/감쇠된다.
         list->CopyBufferRegion(buffer.Get(), 0, staging.Get(), 0, size);
         HR(list->Close());
@@ -263,7 +262,7 @@ struct Renderer::Impl {
         ComPtr<ID3DBlob> blob, error;
         if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error))) {
             MEALKIT_FATAL("Root signature: %s",
-                        error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown error");
+                          error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown error");
         }
         HR(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
                                        IID_PPV_ARGS(&rootSignature)));
@@ -361,7 +360,8 @@ struct Renderer::Impl {
             ComPtr<IWICBitmapFrameEncode> frame;
             WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
             const std::wstring path = widen(capturePath.c_str());
-            ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+            ok = SUCCEEDED(
+                     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
                  SUCCEEDED(wic->CreateStream(&stream)) &&
                  SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
                  SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
@@ -426,7 +426,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch));
     m->uma = arch.UMA != FALSE;
     MEALKIT_INFO("GPU: %s | feature level %X | %s memory", m->adapterName.c_str(),
-               static_cast<unsigned>(fl.MaxSupportedFeatureLevel), m->uma ? "unified (UMA)" : "dedicated");
+                 static_cast<unsigned>(fl.MaxSupportedFeatureLevel), m->uma ? "unified (UMA)" : "dedicated");
 
     if (desc.debugLayer) {
         ComPtr<ID3D12InfoQueue1> infoQueue;
@@ -441,8 +441,8 @@ bool Renderer::init(const RendererDesc& desc) {
     HR(m->device->CreateCommandQueue(&qd, IID_PPV_ARGS(&m->queue)));
 
     BOOL allowTearing = FALSE;
-    if (SUCCEEDED(m->factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing,
-                                                  sizeof(allowTearing))))
+    if (SUCCEEDED(
+            m->factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing))))
         m->tearingSupported = allowTearing != FALSE;
 
     m->swapchainFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
@@ -635,7 +635,7 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
     if (!gpu) {
         if (!m->uploadOverflowWarned) {
             MEALKIT_WARN("Upload ring full (%llu bytes requested); raise kUploadBytesPerFrame",
-                       static_cast<unsigned long long>(bytes));
+                         static_cast<unsigned long long>(bytes));
             m->uploadOverflowWarned = true;
         }
         return;

@@ -35,9 +35,9 @@ struct FrameParams {
     Vec3 cameraPos;
     Vec3 sunDirection{0.4f, 0.8f, 0.3f}; // 태양을 향하는 방향 (정규화는 렌더러가 한다)
     Vec3 sunColor{1.0f, 0.95f, 0.85f};
-    Vec3 skyColor{0.30f, 0.38f, 0.50f};    // 선형 색 공간
+    Vec3 skyColor{0.30f, 0.38f, 0.50f}; // 선형 색 공간
     Vec3 groundColor{0.20f, 0.17f, 0.14f};
-    Vec3 fogColor{0.50f, 0.62f, 0.78f};    // 배경 지우기 색으로도 쓴다
+    Vec3 fogColor{0.50f, 0.62f, 0.78f}; // 배경 지우기 색으로도 쓴다
     f32 fogDensity = 0.008f;
 };
 
