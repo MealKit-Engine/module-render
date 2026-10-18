@@ -42,8 +42,9 @@ struct alignas(16) FrameConstants {
     f32 skyColor[4];
     f32 groundColor[4];
     f32 fogColor[4];
+    f32 screenTint[4];
 };
-static_assert(sizeof(FrameConstants) == 160);
+static_assert(sizeof(FrameConstants) == 176);
 
 ID3D12Device* g_errorDevice = nullptr;
 
@@ -627,7 +628,8 @@ bool Renderer::beginFrame(const FrameParams& p) {
                                           m->backBufferIndex * m->rtvStride};
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = m->dsvHeap->GetCPUDescriptorHandleForHeapStart();
     cmd->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    const f32 clear[4] = {p.fogColor.x, p.fogColor.y, p.fogColor.z, 1.0f};
+    const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // 배경도 번쩍임을 받는다
+    const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
     cmd->ClearRenderTargetView(rtv, clear, 0, nullptr);
     cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, nullptr);
 
@@ -662,6 +664,8 @@ bool Renderer::beginFrame(const FrameParams& p) {
     std::memcpy(fc.skyColor, skyColor, sizeof(skyColor));
     std::memcpy(fc.groundColor, groundColor, sizeof(groundColor));
     std::memcpy(fc.fogColor, fogColor, sizeof(fogColor));
+    const f32 tint[4] = {p.tintColor.x, p.tintColor.y, p.tintColor.z, std::clamp(p.tintAmount, 0.0f, 1.0f)};
+    std::memcpy(fc.screenTint, tint, sizeof(tint));
 
     void* cpu = nullptr;
     const D3D12_GPU_VIRTUAL_ADDRESS gpu = m->allocUpload(sizeof(fc), &cpu);

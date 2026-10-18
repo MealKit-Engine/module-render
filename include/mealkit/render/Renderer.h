@@ -42,6 +42,9 @@ struct FrameParams {
     Vec3 groundColor{0.20f, 0.17f, 0.14f};
     Vec3 fogColor{0.50f, 0.62f, 0.78f}; // 배경 지우기 색으로도 쓴다
     f32 fogDensity = 0.008f;
+    // 화면 전체를 이 색(선형)으로 섞는다 (연출 표의 번쩍임, 엔진이 feedback::Player에서 채운다). 0 = 없음
+    Vec3 tintColor{1.0f, 1.0f, 1.0f};
+    f32 tintAmount = 0.0f;
 };
 
 struct RendererDesc {
