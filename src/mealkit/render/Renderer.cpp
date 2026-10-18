@@ -15,6 +15,8 @@
 
 #include "g_ForwardPS.h"
 #include "g_ForwardVS.h"
+#include "g_UiPS.h"
+#include "g_UiVS.h"
 
 #if defined(TRACY_ENABLE)
 #include <optional>
@@ -226,6 +228,18 @@ struct Renderer::Impl {
     ComPtr<ID3D12PipelineState> pipeline;
     std::vector<GpuMesh> meshes;
 
+    // 2D UI (shaders/Ui.hlsl): 글자 SDF 아틀라스 + 이미지 아틀라스, 셰이더가 보는 SRV 힙 하나 (2칸)
+    ComPtr<ID3D12RootSignature> uiRootSignature;
+    ComPtr<ID3D12PipelineState> uiPipeline;
+    ComPtr<ID3D12DescriptorHeap> uiSrvHeap;
+    ComPtr<ID3D12Resource> uiAtlas[2];
+    struct AtlasUpload {
+        u8 atlas;
+        u32 x, y, w, h;
+        std::vector<u8> pixels;
+    };
+    std::vector<AtlasUpload> uiUploads; // 아직 GPU에 올리지 않은 영역 (차례대로)
+
     u32 width = 0, height = 0;
     u32 frameIndex = 0;
     UINT backBufferIndex = 0;
@@ -343,6 +357,129 @@ struct Renderer::Impl {
         pd.DSVFormat = kDepthFormat;
         pd.SampleDesc.Count = 1;
         HR(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pipeline)));
+    }
+
+    void createUiPipeline() {
+        D3D12_DESCRIPTOR_RANGE range{};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 2; // t1 글자, t2 이미지
+        range.BaseShaderRegister = 1;
+        D3D12_ROOT_PARAMETER params[3] = {};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; // b0: 화면 크기
+        params[0].Constants.Num32BitValues = 4;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; // t0: 사각형들
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges = &range;
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_STATIC_SAMPLER_DESC sampler{};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 3;
+        rs.pParameters = params;
+        rs.NumStaticSamplers = 1;
+        rs.pStaticSamplers = &sampler;
+        ComPtr<ID3DBlob> blob, error;
+        if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)))
+            MEALKIT_FATAL("UI root signature: %s",
+                          error ? static_cast<const char*>(error->GetBufferPointer()) : "unknown error");
+        HR(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                       IID_PPV_ARGS(&uiRootSignature)));
+
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = uiRootSignature.Get();
+        pd.VS = {g_UiVS, sizeof(g_UiVS)};
+        pd.PS = {g_UiPS, sizeof(g_UiPS)};
+        D3D12_RENDER_TARGET_BLEND_DESC& b = pd.BlendState.RenderTarget[0];
+        b.BlendEnable = TRUE; // 미리 곱한 알파
+        b.SrcBlend = D3D12_BLEND_ONE;
+        b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        b.BlendOp = D3D12_BLEND_OP_ADD;
+        b.SrcBlendAlpha = D3D12_BLEND_ONE;
+        b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pd.SampleMask = UINT_MAX;
+        pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pd.RasterizerState.DepthClipEnable = TRUE;
+        pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pd.NumRenderTargets = 1;
+        pd.RTVFormats[0] = kOverlayFormat;
+        pd.SampleDesc.Count = 1;
+        HR(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&uiPipeline)));
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 2;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        HR(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&uiSrvHeap)));
+        const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const DXGI_FORMAT formats[2] = {DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM};
+        const D3D12_HEAP_PROPERTIES defaultHeap = heapProperties(D3D12_HEAP_TYPE_DEFAULT);
+        for (u32 i = 0; i < 2; ++i) {
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = kUiAtlasSize;
+            td.Height = kUiAtlasSize;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.Format = formats[i];
+            td.SampleDesc.Count = 1;
+            HR(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+                                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                               IID_PPV_ARGS(&uiAtlas[i])));
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = formats[i];
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(uiAtlas[i].Get(), &sd,
+                                             {uiSrvHeap->GetCPUDescriptorHandleForHeapStart().ptr + i * stride});
+        }
+    }
+
+    // 기다리던 아틀라스 영역을 이번 프레임 업로드 링으로 복사한다 (자리가 없으면 다음 프레임에)
+    void flushUiUploads(ID3D12GraphicsCommandList* list) {
+        size_t done = 0;
+        for (; done < uiUploads.size(); ++done) {
+            const AtlasUpload& u = uiUploads[done];
+            const u32 bpp = u.atlas == 0 ? 1u : 4u;
+            const u32 pitch = (u.w * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+            const u64 bytes = static_cast<u64>(pitch) * u.h + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+            void* cpu = nullptr;
+            const D3D12_GPU_VIRTUAL_ADDRESS address = allocUpload(bytes, &cpu);
+            if (!address) break;
+            // 배치 정렬(512바이트)에 맞춘다
+            const u64 offset = (address - uploadGpu + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+                               ~static_cast<u64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+            u8* dst = uploadCpu + offset;
+            for (u32 row = 0; row < u.h; ++row)
+                std::memcpy(dst + static_cast<size_t>(row) * pitch, u.pixels.data() + static_cast<size_t>(row) * u.w * bpp,
+                            static_cast<size_t>(u.w) * bpp);
+            ID3D12Resource* tex = uiAtlas[u.atlas].Get();
+            const D3D12_RESOURCE_BARRIER toCopy =
+                transition(tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1, &toCopy);
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = uploadBuffer.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = offset;
+            src.PlacedFootprint.Footprint = {u.atlas == 0 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM, u.w, u.h, 1, pitch};
+            D3D12_TEXTURE_COPY_LOCATION dstLoc{};
+            dstLoc.pResource = tex;
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&dstLoc, u.x, u.y, 0, &src, nullptr);
+            const D3D12_RESOURCE_BARRIER toRead =
+                transition(tex, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &toRead);
+        }
+        uiUploads.erase(uiUploads.begin(), uiUploads.begin() + static_cast<std::ptrdiff_t>(done));
     }
 
     void createSwapchainResources() {
@@ -541,6 +678,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->uploadGpu = m->uploadBuffer->GetGPUVirtualAddress();
 
     m->createPipeline();
+    m->createUiPipeline();
     m->createSwapchainResources();
 #if defined(TRACY_ENABLE)
     m->tracyGpu = TracyD3D12Context(m->device.Get(), m->queue.Get());
@@ -708,6 +846,57 @@ void Renderer::beginOverlay() {
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv{m->rtvHeap->GetCPUDescriptorHandleForHeapStart().ptr +
                                           (kBackBufferCount + m->backBufferIndex) * m->rtvStride};
     m->cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+}
+
+void Renderer::updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels) {
+    if (!m || w == 0 || h == 0 || x + w > kUiAtlasSize || y + h > kUiAtlasSize) return;
+    const u32 bpp = atlas == UiAtlas::Glyphs ? 1u : 4u;
+    // 큰 영역은 줄 묶음으로 나눈다 (프레임 업로드 링에 들어가게)
+    const u32 rowsPerPiece = std::max(1u, static_cast<u32>((1u << 20) / (w * bpp)));
+    for (u32 row = 0; row < h; row += rowsPerPiece) {
+        Impl::AtlasUpload u;
+        u.atlas = static_cast<u8>(atlas);
+        u.x = x;
+        u.y = y + row;
+        u.w = w;
+        u.h = std::min(rowsPerPiece, h - row);
+        u.pixels.assign(pixels + static_cast<size_t>(row) * w * bpp, pixels + static_cast<size_t>(row + u.h) * w * bpp);
+        m->uiUploads.push_back(std::move(u));
+    }
+}
+
+void Renderer::drawUi(const UiQuad* quads, u32 count) {
+    if (!m || !m->inFrame) return;
+    ID3D12GraphicsCommandList* cmd = m->cmd.Get();
+    m->flushUiUploads(cmd);
+    if (count == 0) return;
+    const u64 bytes = static_cast<u64>(count) * sizeof(UiQuad);
+    void* cpu = nullptr;
+    const D3D12_GPU_VIRTUAL_ADDRESS gpu = m->allocUpload(bytes, &cpu);
+    if (!gpu) {
+        if (!m->uploadOverflowWarned) {
+            MEALKIT_WARN("Upload ring full for %u UI quads", count);
+            m->uploadOverflowWarned = true;
+        }
+        return;
+    }
+    std::memcpy(cpu, quads, bytes);
+    beginOverlay();
+    const D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<f32>(m->width), static_cast<f32>(m->height), 0.0f, 1.0f};
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(m->width), static_cast<LONG>(m->height)};
+    cmd->RSSetViewports(1, &viewport);
+    cmd->RSSetScissorRects(1, &scissor);
+    cmd->SetPipelineState(m->uiPipeline.Get());
+    cmd->SetGraphicsRootSignature(m->uiRootSignature.Get());
+    ID3D12DescriptorHeap* heaps[] = {m->uiSrvHeap.Get()};
+    cmd->SetDescriptorHeaps(1, heaps);
+    const f32 constants[4] = {static_cast<f32>(m->width), static_cast<f32>(m->height), 0.0f, 0.0f};
+    cmd->SetGraphicsRoot32BitConstants(0, 4, constants, 0);
+    cmd->SetGraphicsRootShaderResourceView(1, gpu);
+    cmd->SetGraphicsRootDescriptorTable(2, m->uiSrvHeap->GetGPUDescriptorHandleForHeapStart());
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmd->DrawInstanced(6, count, 0, 0);
+    m->stats.drawCalls += 1;
 }
 
 void Renderer::waitIdle() {

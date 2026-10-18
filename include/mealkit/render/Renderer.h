@@ -83,6 +83,30 @@ struct RenderStats {
     u32 instances = 0;
 };
 
+// 2D UI 사각형 하나 (HLSL UiQuad와 같은 112바이트, shaders/Ui.hlsl). mealkit/ui/가 채운다. 좌표는 백버퍼 픽셀.
+struct UiQuad {
+    f32 rect[4] = {};                    // x, y, w, h (회전 전 상자)
+    f32 clip[4] = {-1e9f, -1e9f, 1e9f, 1e9f}; // x0, y0, x1, y1 (이 밖은 그리지 않는다)
+    f32 radii[4] = {};                   // 왼쪽 위, 오른쪽 위, 오른쪽 아래, 왼쪽 아래
+    f32 uv[4] = {};                      // 아틀라스 u0, v0, u1, v1 (이미지·글자)
+    f32 gradient[4] = {};                // 선형: 시작 xy, 끝 xy / 원형: 중심 xy, 반지름 xy (상자 0..1 좌표)
+    u32 color0 = 0;                      // sRGB RGBA8 (rgba()), 곧은 알파
+    u32 color1 = 0;
+    u32 strokeColor = 0;
+    u32 flags = 0; // kUiShape/Image/Glyph/Shadow | kUiLinear/kUiRadial
+    f32 strokeWidth = 0.0f;
+    f32 rotation = 0.0f; // 라디안, 상자 가운데 기준
+    f32 softness = 0.0f; // 그림자 흐림 (픽셀)
+    f32 sdfScale = 0.0f; // 글자: SDF 값 1당 화면 픽셀
+};
+static_assert(sizeof(UiQuad) == 112, "UiQuad must match the HLSL layout");
+
+inline constexpr u32 kUiShape = 0, kUiImage = 1, kUiGlyph = 2, kUiShadow = 3;
+inline constexpr u32 kUiLinear = 1u << 4, kUiRadial = 2u << 4;
+
+enum class UiAtlas : u8 { Glyphs, Images }; // 글자 SDF (1바이트), UI 이미지 (RGBA 4바이트)
+inline constexpr u32 kUiAtlasSize = 2048;
+
 // 에디터 UI 같은 확장 모듈용 원시 D3D12 핸들. commandList는 beginFrame~endFrame 사이에만 유효하다.
 struct NativeHandles {
     void* device = nullptr;      // ID3D12Device*
@@ -113,6 +137,10 @@ public:
     void drawInstances(MeshId mesh, const InstanceData* instances, u32 count);
     // 3D 이후 UI를 그리기 위해 깊이 없는 sRGB 미변환 백버퍼 뷰를 묶는다.
     void beginOverlay();
+    // UI 아틀라스의 한 영역을 바꾼다 (언제든, 다음 drawUi 전에 GPU에 올린다). pixels는 w×h, 행 사이 빈틈 없음
+    void updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels);
+    // 2D UI를 그린다: 3D 다음, 백버퍼 원래 해상도(동적 해상도와 무관), 깊이 없음. 드로우 콜 1회
+    void drawUi(const UiQuad* quads, u32 count);
     void endFrame();
     void waitIdle();
 
