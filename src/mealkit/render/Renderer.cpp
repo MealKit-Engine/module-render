@@ -3,6 +3,7 @@
 #include "mealkit/core/Log.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -61,6 +62,74 @@ std::string narrow(const wchar_t* w) {
     std::string out(len > 0 ? len - 1 : 0, '\0');
     if (len > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
     return out;
+}
+
+// 사용자 모드 드라이버 버전. 장치 관리자·제조사 사이트가 보여 주는 네 자리 번호와 같다.
+std::string driverVersion(IDXGIAdapter1* adapter) {
+    LARGE_INTEGER v{};
+    if (FAILED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &v))) return {};
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", HIWORD(v.HighPart), LOWORD(v.HighPart), HIWORD(v.LowPart),
+                  LOWORD(v.LowPart));
+    return buf;
+}
+
+// 고성능 우선 순서로 D3D12 장치를 만들 수 있는 첫 하드웨어 어댑터.
+ComPtr<IDXGIAdapter1> findAdapter(IDXGIFactory6* factory) {
+    for (UINT i = 0;; ++i) {
+        ComPtr<IDXGIAdapter1> candidate;
+        if (factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate)) ==
+            DXGI_ERROR_NOT_FOUND)
+            break;
+        DXGI_ADAPTER_DESC1 desc;
+        candidate->GetDesc1(&desc);
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr)))
+            return candidate;
+    }
+    return nullptr;
+}
+
+void describeGpu(IDXGIAdapter1* adapter, ID3D12Device* device, GpuInfo& info) {
+    DXGI_ADAPTER_DESC1 desc;
+    adapter->GetDesc1(&desc);
+    info.adapter = narrow(desc.Description);
+    info.driverVersion = driverVersion(adapter);
+    info.vendorId = desc.VendorId;
+    info.deviceId = desc.DeviceId;
+    info.dedicatedVideoMemory = desc.DedicatedVideoMemory;
+    info.sharedSystemMemory = desc.SharedSystemMemory;
+
+    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+                                        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS fl{_countof(levels), levels, D3D_FEATURE_LEVEL_11_0};
+    device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
+    info.featureLevel = static_cast<u32>(fl.MaxSupportedFeatureLevel);
+
+    // 런타임이 모르는 셰이더 모델을 물으면 실패하므로 높은 것부터 내려간다 (SDK 열거값이 없는 것은 숫자로).
+    for (u32 model = 0x69; model >= 0x60; --model) {
+        D3D12_FEATURE_DATA_SHADER_MODEL sm{static_cast<D3D_SHADER_MODEL>(model)};
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) {
+            info.shaderModel = static_cast<u32>(sm.HighestShaderModel);
+            break;
+        }
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))))
+        info.resourceBindingTier = static_cast<u32>(options.ResourceBindingTier);
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1 options1{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &options1, sizeof(options1)))) {
+        info.waveLaneCountMin = options1.WaveLaneCountMin;
+        info.waveLaneCountMax = options1.WaveLaneCountMax;
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options7{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options7, sizeof(options7))))
+        info.meshShaderTier = static_cast<u32>(options7.MeshShaderTier);
+
+    D3D12_FEATURE_DATA_ARCHITECTURE arch{};
+    device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch));
+    info.uma = arch.UMA != FALSE;
 }
 
 std::wstring widen(const char* s) {
@@ -161,8 +230,8 @@ struct Renderer::Impl {
     UINT backBufferIndex = 0;
     bool vsync = true;
     bool inFrame = false;
-    std::string adapterName;
-    bool uma = false;
+    GpuInfo gpu;
+    std::string initError;
     RenderStats stats;
     std::string capturePath;
 #if defined(TRACY_ENABLE)
@@ -192,25 +261,6 @@ struct Renderer::Impl {
         uploadOffset = aligned + size;
         *cpu = uploadCpu + aligned;
         return uploadGpu + aligned;
-    }
-
-    bool pickAdapter() {
-        for (UINT i = 0;; ++i) {
-            ComPtr<IDXGIAdapter1> candidate;
-            if (factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-                                                    IID_PPV_ARGS(&candidate)) == DXGI_ERROR_NOT_FOUND)
-                break;
-            DXGI_ADAPTER_DESC1 desc;
-            candidate->GetDesc1(&desc);
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-            if (SUCCEEDED(
-                    D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), nullptr))) {
-                adapter = candidate;
-                adapterName = narrow(desc.Description);
-                return true;
-            }
-        }
-        return false;
     }
 
     // 정적 버퍼: DEFAULT 힙에 만들고 임시 업로드 버퍼에서 복사한다 (로딩 시점 전용).
@@ -400,33 +450,30 @@ bool Renderer::init(const RendererDesc& desc) {
     }
 
     if (FAILED(CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&m->factory)))) {
-        MEALKIT_ERROR("DXGI 1.6 is required (Windows 10 1803 or later)");
+        m->initError = "DXGI 1.6 is required (Windows 10 1803 or later)";
+        MEALKIT_ERROR("%s", m->initError.c_str());
         return false;
     }
-    if (!m->pickAdapter()) {
-        MEALKIT_ERROR("No Direct3D 12 capable GPU found");
+    m->adapter = findAdapter(m->factory.Get());
+    if (!m->adapter) {
+        m->initError = "No Direct3D 12 capable GPU found";
+        MEALKIT_ERROR("%s", m->initError.c_str());
         return false;
     }
     HR(D3D12CreateDevice(m->adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&m->device)));
     g_errorDevice = m->device.Get();
 
-    const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
-                                        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    D3D12_FEATURE_DATA_FEATURE_LEVELS fl{_countof(levels), levels, D3D_FEATURE_LEVEL_11_0};
-    m->device->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl));
-
-    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_0};
-    if (FAILED(m->device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
-        sm.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
-        MEALKIT_ERROR("Shader Model 6.0 is required (update the GPU driver)");
+    describeGpu(m->adapter.Get(), m->device.Get(), m->gpu);
+    const GpuInfo& gpu = m->gpu;
+    MEALKIT_INFO("GPU: %s | driver %s | feature level %u_%u | SM %u.%u | binding tier %u | %s memory",
+                 gpu.adapter.c_str(), gpu.driverVersion.empty() ? "?" : gpu.driverVersion.c_str(),
+                 gpu.featureLevel >> 12, (gpu.featureLevel >> 8) & 0xF, gpu.shaderModel >> 4, gpu.shaderModel & 0xF,
+                 gpu.resourceBindingTier, gpu.uma ? "unified (UMA)" : "dedicated");
+    m->initError = gpuMinimumError(gpu);
+    if (!m->initError.empty()) {
+        MEALKIT_ERROR("%s", m->initError.c_str());
         return false;
     }
-
-    D3D12_FEATURE_DATA_ARCHITECTURE arch{};
-    m->device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch));
-    m->uma = arch.UMA != FALSE;
-    MEALKIT_INFO("GPU: %s | feature level %X | %s memory", m->adapterName.c_str(),
-                 static_cast<unsigned>(fl.MaxSupportedFeatureLevel), m->uma ? "unified (UMA)" : "dedicated");
 
     if (desc.debugLayer) {
         ComPtr<ID3D12InfoQueue1> infoQueue;
@@ -750,8 +797,51 @@ bool Renderer::vsync() const { return m && m->vsync; }
 void Renderer::requestCapture(const char* pngPath) {
     if (m) m->capturePath = pngPath;
 }
-const char* Renderer::adapterName() const { return m ? m->adapterName.c_str() : ""; }
-bool Renderer::isUma() const { return m && m->uma; }
+const char* Renderer::adapterName() const { return m ? m->gpu.adapter.c_str() : ""; }
+bool Renderer::isUma() const { return m && m->gpu.uma; }
+const GpuInfo& Renderer::gpu() const {
+    static const GpuInfo empty{};
+    return m ? m->gpu : empty;
+}
+const char* Renderer::initError() const { return m ? m->initError.c_str() : ""; }
+
+std::string gpuMinimumError(const GpuInfo& info) {
+    // 최소 사양 Intel 11세대(Xe-LP): SM 6.6 bindless(ResourceDescriptorHeap)와 바인딩 티어 3을 2단계 텍스처가 쓴다.
+    // 같은 GPU라도 제조사가 깐 오래된 드라이버면 6.6이 안 나오므로 드라이버 버전을 같이 알려 준다.
+    const char* driver = info.driverVersion.empty() ? "unknown" : info.driverVersion.c_str();
+    char buf[512];
+    if (info.shaderModel < 0x66) {
+        std::snprintf(buf, sizeof(buf),
+                      "Shader Model 6.6 is required, but %s (driver %s) reports %u.%u. Update the GPU driver. "
+                      "Minimum GPU: Intel 11th gen (Iris Xe / UHD Xe) integrated graphics or newer.",
+                      info.adapter.c_str(), driver, info.shaderModel >> 4, info.shaderModel & 0xF);
+        return buf;
+    }
+    if (info.resourceBindingTier < 3) {
+        std::snprintf(buf, sizeof(buf),
+                      "Resource binding tier 3 is required, but %s (driver %s) reports tier %u. Update the GPU driver.",
+                      info.adapter.c_str(), driver, info.resourceBindingTier);
+        return buf;
+    }
+    return {};
+}
+
+bool queryGpu(GpuInfo& out, std::string* error) {
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    ComPtr<ID3D12Device> device;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        if (error) *error = "DXGI 1.6 is required (Windows 10 1803 or later)";
+        return false;
+    }
+    adapter = findAdapter(factory.Get());
+    if (!adapter || FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+        if (error) *error = "No Direct3D 12 capable GPU found";
+        return false;
+    }
+    describeGpu(adapter.Get(), device.Get(), out);
+    return true;
+}
 const RenderStats& Renderer::stats() const {
     static const RenderStats empty{};
     return m ? m->stats : empty;

@@ -3,6 +3,8 @@
 #include "mealkit/core/Math.h"
 #include "mealkit/render/Mesh.h"
 
+#include <string>
+
 namespace mealkit::render {
 
 using MeshId = u32;
@@ -48,6 +50,29 @@ struct RendererDesc {
     bool vsync = true;
     bool debugLayer = false;
 };
+
+// GPU 기능 조사 결과. 시작 로그와 `--gpu-info`(최소 사양 실기 측정 기록)에 쓴다.
+struct GpuInfo {
+    std::string adapter;       // 어댑터 이름 (UTF-8)
+    std::string driverVersion; // 사용자 모드 드라이버 버전 "31.0.101.5186" (모르면 빈 문자열)
+    u32 vendorId = 0;          // 0x8086 Intel, 0x1002 AMD, 0x10DE NVIDIA
+    u32 deviceId = 0;
+    u64 dedicatedVideoMemory = 0;
+    u64 sharedSystemMemory = 0;
+    u32 featureLevel = 0;        // D3D_FEATURE_LEVEL (0xC100 = 12_1)
+    u32 shaderModel = 0;         // D3D_SHADER_MODEL (0x66 = 6.6)
+    u32 resourceBindingTier = 0; // 1~3
+    u32 meshShaderTier = 0;      // 0 = 없음 (참고용, 엔진은 쓰지 않는다)
+    u32 waveLaneCountMin = 0;
+    u32 waveLaneCountMax = 0;
+    bool uma = false; // 내장 그래픽처럼 CPU와 메모리를 같이 쓴다
+};
+
+// 최소 사양에 못 미치는 이유. 맞으면 빈 문자열.
+std::string gpuMinimumError(const GpuInfo& info);
+
+// 창 없이 렌더러가 고를 GPU를 조사한다. GPU가 없으면 false와 error.
+bool queryGpu(GpuInfo& out, std::string* error = nullptr);
 
 struct RenderStats {
     u32 drawCalls = 0;
@@ -96,6 +121,8 @@ public:
     void requestCapture(const char* pngPath); // 다음 endFrame에서 백버퍼를 PNG로 저장
 
     const char* adapterName() const;
+    const GpuInfo& gpu() const;
+    const char* initError() const; // init()이 false일 때 이유
     bool isUma() const;
     const RenderStats& stats() const;
 
