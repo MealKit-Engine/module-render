@@ -35,6 +35,7 @@ struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
     Vec3 cameraPos;
+    Vec3 cameraForward{0.0f, 0.0f, 1.0f}; // 소리 리스너 방향 (엔진이 프레임마다 audio::Engine::setListener에 넘긴다)
     Vec3 sunDirection{0.4f, 0.8f, 0.3f}; // 태양을 향하는 방향 (정규화는 렌더러가 한다)
     Vec3 sunColor{1.0f, 0.95f, 0.85f};
     Vec3 skyColor{0.30f, 0.38f, 0.50f}; // 선형 색 공간
