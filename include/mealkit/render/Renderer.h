@@ -2,6 +2,7 @@
 
 #include "mealkit/core/Math.h"
 #include "mealkit/render/Mesh.h"
+#include "mealkit/rhi/Rhi.h"
 
 #include <string>
 
@@ -55,28 +56,10 @@ struct RendererDesc {
     bool debugLayer = false;
 };
 
-// GPU 기능 조사 결과. 시작 로그와 `--gpu-info`(최소 사양 실기 측정 기록)에 쓴다.
-struct GpuInfo {
-    std::string adapter;       // 어댑터 이름 (UTF-8)
-    std::string driverVersion; // 사용자 모드 드라이버 버전 "31.0.101.5186" (모르면 빈 문자열)
-    u32 vendorId = 0;          // 0x8086 Intel, 0x1002 AMD, 0x10DE NVIDIA
-    u32 deviceId = 0;
-    u64 dedicatedVideoMemory = 0;
-    u64 sharedSystemMemory = 0;
-    u32 featureLevel = 0;        // D3D_FEATURE_LEVEL (0xC100 = 12_1)
-    u32 shaderModel = 0;         // D3D_SHADER_MODEL (0x66 = 6.6)
-    u32 resourceBindingTier = 0; // 1~3
-    u32 meshShaderTier = 0;      // 0 = 없음 (참고용, 엔진은 쓰지 않는다)
-    u32 waveLaneCountMin = 0;
-    u32 waveLaneCountMax = 0;
-    bool uma = false; // 내장 그래픽처럼 CPU와 메모리를 같이 쓴다
-};
-
-// 최소 사양에 못 미치는 이유. 맞으면 빈 문자열.
-std::string gpuMinimumError(const GpuInfo& info);
-
-// 창 없이 렌더러가 고를 GPU를 조사한다. GPU가 없으면 false와 error.
-bool queryGpu(GpuInfo& out, std::string* error = nullptr);
+// GPU 조사는 RHI 백엔드가 한다 (출시 exe의 --system-info, 최소 사양 검사)
+using GpuInfo = rhi::GpuInfo;
+using rhi::gpuMinimumError;
+using rhi::queryGpu;
 
 struct RenderStats {
     u32 drawCalls = 0;
@@ -107,17 +90,8 @@ inline constexpr u32 kUiLinear = 1u << 4, kUiRadial = 2u << 4;
 enum class UiAtlas : u8 { Glyphs, Images }; // 글자 SDF (1바이트), UI 이미지 (RGBA 4바이트)
 inline constexpr u32 kUiAtlasSize = 2048;
 
-// 에디터 UI 같은 확장 모듈용 원시 D3D12 핸들. commandList는 beginFrame~endFrame 사이에만 유효하다.
-struct NativeHandles {
-    void* device = nullptr;      // ID3D12Device*
-    void* queue = nullptr;       // ID3D12CommandQueue*
-    void* commandList = nullptr; // ID3D12GraphicsCommandList*
-    u32 framesInFlight = 0;
-    u32 overlayFormat = 0; // DXGI_FORMAT: beginOverlay()가 묶는 렌더 타깃 형식 (감마 변환 없음)
-};
-
-// DX12 포워드 렌더러. 프레임 2개를 동시에 처리하고, 프레임별 데이터는 계속 매핑된 업로드 링 버퍼에 쓴다.
-// 내장 그래픽(UMA)에서는 업로드 힙이 곧 GPU가 읽는 메모리라 복사가 전혀 없다.
+// 포워드 렌더러 (RHI 위, 그래픽 API를 직접 부르지 않는다). 프레임 2개를 동시에 처리하고, 프레임별 데이터는
+// RHI 업로드 링에 쓴다. 내장 그래픽(UMA)에서는 업로드 메모리가 곧 GPU가 읽는 메모리라 복사가 전혀 없다.
 class Renderer {
 public:
     Renderer() = default;
@@ -144,7 +118,7 @@ public:
     void endFrame();
     void waitIdle();
 
-    NativeHandles native() const;
+    rhi::Device& device(); // 디버그 UI 그리기 (rhi::imgui*)
     u32 width() const;
     u32 height() const;
 
