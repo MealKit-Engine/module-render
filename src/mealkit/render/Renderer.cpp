@@ -2,6 +2,7 @@
 
 #include "mealkit/core/Log.h"
 #include "mealkit/platform/Image.h"
+#include "mealkit/render/ShaderReload.h"
 
 #include <algorithm>
 #include <cstring>
@@ -59,6 +60,8 @@ struct Renderer::Impl {
     rhi::Device device;
     rhi::Pipeline forward;
     rhi::Pipeline ui;
+    rhi::PipelineDesc forwardDesc, uiDesc; // 셰이더 핫 리로드가 바이트코드만 바꿔 다시 만든다
+    ShaderReloader shaderReload;
     std::vector<GpuMesh> meshes;
 
     // 2D UI (shaders/Ui.hlsl): 글자 SDF 아틀라스 + 이미지 아틀라스
@@ -134,6 +137,7 @@ bool Renderer::init(const RendererDesc& desc) {
     forward.vertexStride = sizeof(Vertex);
     forward.target = rhi::Target::Scene;
     m->forward = m->device.createPipeline(forward);
+    m->forwardDesc = forward;
 
     rhi::PipelineDesc ui;
     ui.vs = {g_UiVS, sizeof(g_UiVS)};
@@ -142,6 +146,20 @@ bool Renderer::init(const RendererDesc& desc) {
     ui.cullBack = false;
     ui.premultipliedBlend = true; // 미리 곱한 알파
     m->ui = m->device.createPipeline(ui);
+    m->uiDesc = ui;
+    // 개발 빌드: engine/shaders가 바뀌면 다시 컴파일해 바꿔 끼운다 (출시 빌드와 엔진 폴더가 없는 PC에서는 아무것도 하지 않는다)
+    m->shaderReload.add("Forward.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+        rhi::PipelineDesc d = m->forwardDesc;
+        d.vs = vs;
+        d.ps = ps;
+        return m->device.recreatePipeline(m->forward, d);
+    });
+    m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+        rhi::PipelineDesc d = m->uiDesc;
+        d.vs = vs;
+        d.ps = ps;
+        return m->device.recreatePipeline(m->ui, d);
+    });
 
     m->uiAtlas[0] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::R8Unorm);
     m->uiAtlas[1] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::Rgba8Unorm);
@@ -182,6 +200,7 @@ MeshId Renderer::createMesh(const MeshData& data) {
 }
 
 bool Renderer::beginFrame(const FrameParams& p) {
+    if (m) m->shaderReload.update(); // 프레임 밖에서 (파이프라인을 바꿀 때 GPU를 기다린다)
     if (!m || !m->device.beginFrame()) return false;
     rhi::CommandList& cmd = m->device.cmd();
 
