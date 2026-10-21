@@ -52,6 +52,7 @@ struct GpuMesh {
     rhi::Buffer vertexBuffer;
     rhi::Buffer indexBuffer;
     u32 indexCount = 0;
+    BoundingSphere bounds;
 };
 
 } // namespace
@@ -78,6 +79,7 @@ struct Renderer::Impl {
     bool inFrame = false;
     bool uploadOverflowWarned = false;
     RenderStats stats;
+    Frustum frustum;
     i32 openPass = -1; // 지금 GPU 시간을 재는 패스 (GpuPass, 없으면 -1)
     std::string capturePath;
 
@@ -195,6 +197,9 @@ MeshId Renderer::createMesh(const MeshData& data) {
             m->device.createBuffer(rhi::BufferUsage::Index32, data.indices.data(), data.indices.size() * sizeof(u32));
     }
     mesh.indexCount = static_cast<u32>(data.indices.size());
+    std::vector<Vec3> points(data.vertices.size());
+    for (size_t i = 0; i < points.size(); ++i) points[i] = data.vertices[i].position;
+    mesh.bounds = boundingSphere(points.data(), points.size());
     m->meshes.push_back(mesh);
     return static_cast<MeshId>(m->meshes.size() - 1);
 }
@@ -241,6 +246,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     std::memcpy(cpu, &fc, sizeof(fc)); // 프레임의 첫 할당이라 항상 자리가 있다
 
     m->stats = {};
+    m->frustum = Frustum::fromViewProj(p.viewProj);
     const rhi::GpuTimes& gpu = m->device.gpuTimes();
     m->stats.gpuValid = gpu.valid;
     m->stats.gpuFrameMs = gpu.frameMs;
@@ -369,6 +375,16 @@ const char* Renderer::initError() const { return m ? m->device.initError().c_str
 const RenderStats& Renderer::stats() const {
     static const RenderStats empty{};
     return m ? m->stats : empty;
+}
+BoundingSphere Renderer::meshBounds(MeshId mesh) const {
+    return m && mesh < m->meshes.size() ? m->meshes[mesh].bounds : BoundingSphere{};
+}
+const Frustum& Renderer::frustum() const {
+    static const Frustum none; // 평면이 없으면 모두 보인다
+    return m ? m->frustum : none;
+}
+void Renderer::addCulled(u32 count) {
+    if (m) m->stats.culled += count;
 }
 rhi::GpuMemory Renderer::gpuMemory() const { return m ? m->device.gpuMemory() : rhi::GpuMemory{}; }
 

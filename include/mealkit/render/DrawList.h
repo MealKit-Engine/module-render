@@ -2,11 +2,14 @@
 
 #include "mealkit/render/Renderer.h"
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace mealkit::render {
 
 // 한 프레임에 그릴 인스턴스를 메시별로 모은다. submit()하면 메시마다 드로우 콜 1회.
+// submit은 renderer.beginFrame 뒤에 부르고, 그 프레임 프러스텀 밖의 인스턴스(메시 바운딩 구 기준)는 GPU에 올리지 않는다.
 // 버킷 메모리는 프레임 사이에 재사용된다.
 class DrawList {
 public:
@@ -20,15 +23,27 @@ public:
     }
 
     void submit(Renderer& renderer) const {
+        const Frustum& frustum = renderer.frustum();
         for (size_t mesh = 0; mesh < m_buckets.size(); ++mesh) {
             const auto& bucket = m_buckets[mesh];
-            if (!bucket.empty())
-                renderer.drawInstances(static_cast<MeshId>(mesh), bucket.data(), static_cast<u32>(bucket.size()));
+            if (bucket.empty()) continue;
+            const BoundingSphere b = renderer.meshBounds(static_cast<MeshId>(mesh));
+            m_visible.clear();
+            for (const InstanceData& inst : bucket) {
+                const Vec3 s = inst.scale;
+                const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+                const Vec3 c = inst.position + rotate(inst.rotation, Vec3{b.center.x * s.x, b.center.y * s.y, b.center.z * s.z});
+                if (frustum.sphereVisible(c, b.radius * scale)) m_visible.push_back(inst);
+            }
+            renderer.addCulled(static_cast<u32>(bucket.size() - m_visible.size()));
+            if (!m_visible.empty())
+                renderer.drawInstances(static_cast<MeshId>(mesh), m_visible.data(), static_cast<u32>(m_visible.size()));
         }
     }
 
 private:
     std::vector<std::vector<InstanceData>> m_buckets;
+    mutable std::vector<InstanceData> m_visible; // submit의 작업 버퍼 (프레임 사이에 재사용)
 };
 
 } // namespace mealkit::render

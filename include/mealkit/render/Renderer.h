@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mealkit/core/Math.h"
+#include "mealkit/render/Culling.h"
 #include "mealkit/render/Mesh.h"
 #include "mealkit/rhi/Rhi.h"
 
@@ -70,6 +71,7 @@ const char* gpuPassName(GpuPass pass); // "opaque", "shadow", ... (보고서·�
 struct RenderStats {
     u32 drawCalls = 0;
     u32 instances = 0;
+    u32 culled = 0; // 프러스텀 밖이라 빠진 인스턴스 (DrawList::submit)
     // GPU 시간 (타임스탬프): GPU가 끝낸 가장 최근 프레임 값이라 2프레임 늦다. gpuValid가 false면 모른다
     bool gpuValid = false;
     f32 gpuFrameMs = 0.0f;
@@ -114,6 +116,11 @@ public:
     void resize(u32 width, u32 height);
 
     MeshId createMesh(const MeshData& mesh);
+    // 메시 로컬 바운딩 구 (createMesh가 정점에서 구한다). 없는 메시는 반지름 0
+    BoundingSphere meshBounds(MeshId mesh) const;
+    // 이번 프레임 viewProj의 프러스텀 (beginFrame이 만든다). DrawList::submit이 인스턴스를 거른다
+    const Frustum& frustum() const;
+    void addCulled(u32 count); // 통계용 (DrawList::submit)
 
     // false면 이번 프레임은 그리지 않는다 (최소화 등).
     bool beginFrame(const FrameParams& params);
