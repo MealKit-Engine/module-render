@@ -11,6 +11,22 @@ namespace mealkit::render {
 
 using MeshId = u32;
 
+// 머티리얼 (glTF PBR metallic-roughness의 지원 범위, docs/CODING_MODEL.md "모델·머티리얼·텍스처"). 렌더러가 표로 갖고
+// 프레임마다 업로드 링에 쓴다 (shaders/Forward.hlsl Material, 64바이트). 텍스처는 bindless 번호 (kNoTexture = 없음)
+inline constexpr u32 kNoTexture = 0xFFFFFFFFu;
+struct MaterialData {
+    f32 baseColor[4] = {1, 1, 1, 1}; // 선형
+    f32 emissive[3] = {0, 0, 0};
+    f32 metallic = 0.0f;
+    f32 roughness = 1.0f;
+    f32 normalScale = 1.0f;
+    f32 alphaCutoff = 0.0f; // > 0이면 알파 마스크 (이보다 작은 알파는 그리지 않는다)
+    u32 baseColorTexture = kNoTexture;
+    u32 normalTexture = kNoTexture;
+    u32 metallicRoughnessTexture = kNoTexture; // G = 거칠기, B = 금속 (glTF)
+    u32 emissiveTexture = kNoTexture;
+};
+
 // GPU로 그대로 복사되는 인스턴스 데이터 (HLSL Instance 구조체와 동일한 48바이트).
 struct InstanceData {
     Vec3 position;
@@ -131,6 +147,10 @@ public:
     void resize(u32 width, u32 height);
 
     MeshId createMesh(const MeshData& mesh);
+    // 정점의 material 번호가 가리킨다. 0번은 기본 흰색 (init이 만든다)
+    u32 createMaterial(const MaterialData& material);
+    // 밉이 있는 텍스처 (asset::TextureCache). 셰이더가 읽는 bindless 번호
+    u32 createTexture(const rhi::TextureInit& init);
     // 메시 로컬 바운딩 구 (createMesh가 정점에서 구한다). 없는 메시는 반지름 0
     BoundingSphere meshBounds(MeshId mesh) const;
     // 이번 프레임 viewProj의 프러스텀 (beginFrame이 만든다). DrawList::submit이 인스턴스를 거른다

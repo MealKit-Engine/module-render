@@ -27,8 +27,19 @@ struct FrameConstants {
     f32 groundColor[4];
     f32 fogColor[4];
     f32 screenTint[4];
+    u32 materials[4]; // 머티리얼 표의 링 위치, 개수, 0, 0
 };
-static_assert(sizeof(FrameConstants) == 176);
+static_assert(sizeof(FrameConstants) == 192);
+
+// shaders/Forward.hlsl Material (64바이트)
+struct MaterialGpu {
+    f32 baseColor[4];
+    f32 emissive[3];
+    f32 alphaCutoff;
+    f32 metallic, roughness, normalScale, pad;
+    u32 textures[4]; // baseColor, normal, metallicRoughness, emissive (bindless 번호, kNoTexture = 없음)
+};
+static_assert(sizeof(MaterialGpu) == 64);
 
 struct ForwardPush {
     u32 ring = 0;
@@ -66,6 +77,8 @@ struct Renderer::Impl {
     rhi::PipelineDesc forwardDesc, uiDesc; // 셰이더 핫 리로드가 바이트코드만 바꿔 다시 만든다
     ShaderReloader shaderReload;
     std::vector<GpuMesh> meshes;
+    std::vector<MaterialGpu> materials; // 0 = 기본 흰색. 프레임마다 업로드 링에 쓴다
+    std::vector<rhi::Texture> textures;
 
     // 2D UI (shaders/Ui.hlsl): 글자 SDF 아틀라스 + 이미지 아틀라스
     rhi::Texture uiAtlas[2];
@@ -151,7 +164,9 @@ bool Renderer::init(const RendererDesc& desc) {
     forward.ps = {g_ForwardPS, sizeof(g_ForwardPS)};
     forward.vertexAttributes = {{"POSITION", rhi::VertexFormat::Float3, 0},
                                 {"NORMAL", rhi::VertexFormat::Float3, 12},
-                                {"COLOR", rhi::VertexFormat::Unorm8x4, 24}};
+                                {"COLOR", rhi::VertexFormat::Unorm8x4, 24},
+                                {"TEXCOORD", rhi::VertexFormat::Half2, 28},
+                                {"MATERIAL", rhi::VertexFormat::Uint16x2, 32}};
     forward.vertexStride = sizeof(Vertex);
     forward.target = rhi::Target::Scene;
     m->forward = m->device.createPipeline(forward);
@@ -188,6 +203,7 @@ bool Renderer::init(const RendererDesc& desc) {
         return m->device.recreatePipeline(m->ui, d);
     });
 
+    createMaterial({}); // 0번: 기본 흰색 (머티리얼 없는 메시, 상자)
     m->uiAtlas[0] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::R8Unorm);
     m->uiAtlas[1] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::Rgba8Unorm);
     return true;
@@ -202,6 +218,30 @@ void Renderer::shutdown() {
 
 void Renderer::resize(u32 width, u32 height) {
     if (m) m->device.resize(width, height);
+}
+
+u32 Renderer::createMaterial(const MaterialData& d) {
+    MaterialGpu g{};
+    std::memcpy(g.baseColor, d.baseColor, sizeof(g.baseColor));
+    std::memcpy(g.emissive, d.emissive, sizeof(g.emissive));
+    g.alphaCutoff = d.alphaCutoff;
+    g.metallic = d.metallic;
+    g.roughness = d.roughness;
+    g.normalScale = d.normalScale;
+    const u32 textures[4] = {d.baseColorTexture, d.normalTexture, d.metallicRoughnessTexture, d.emissiveTexture};
+    std::memcpy(g.textures, textures, sizeof(textures));
+    if (m->materials.size() >= 0xFFFF) { // 정점의 material은 16비트
+        MEALKIT_WARN("createMaterial: too many materials, using the default");
+        return 0;
+    }
+    m->materials.push_back(g);
+    return static_cast<u32>(m->materials.size() - 1);
+}
+
+u32 Renderer::createTexture(const rhi::TextureInit& init) {
+    const rhi::Texture t = m->device.createTexture(init);
+    m->textures.push_back(t);
+    return m->device.textureIndex(t);
 }
 
 MeshId Renderer::createMesh(const MeshData& data) {
@@ -271,8 +311,14 @@ bool Renderer::beginFrame(const FrameParams& p) {
     std::memcpy(fc.groundColor, groundColor, sizeof(groundColor));
     std::memcpy(fc.fogColor, fogColor, sizeof(fogColor));
     std::memcpy(fc.screenTint, tint, sizeof(tint));
-    u8* cpu = m->device.allocUpload(sizeof(fc), kRingAlignment, &m->frameOffset);
-    std::memcpy(cpu, &fc, sizeof(fc)); // 프레임의 첫 할당이라 항상 자리가 있다
+    u8* cpu = m->device.allocUpload(sizeof(fc), kRingAlignment, &m->frameOffset); // 프레임의 첫 할당이라 항상 자리가 있다
+    u64 materialOffset = 0;
+    const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
+    if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
+    else m->warnOverflow(materialBytes);
+    fc.materials[0] = static_cast<u32>(materialOffset);
+    fc.materials[1] = static_cast<u32>(m->materials.size());
+    std::memcpy(cpu, &fc, sizeof(fc));
 
     m->stats = {};
     m->frustum = Frustum::fromViewProj(p.viewProj);
