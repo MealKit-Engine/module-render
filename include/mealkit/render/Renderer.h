@@ -23,6 +23,19 @@ static_assert(sizeof(InstanceData) == 48, "InstanceData must match the HLSL layo
 
 inline constexpr u32 kInstanceChecker = 1u;   // 바닥용 체커 패턴
 inline constexpr u32 kInstanceHighlight = 2u; // 에디터 선택 강조
+inline constexpr u32 kInstanceOverBudget = 4u; // 에디터 보기 모드 Budget: 에셋 예산을 넘은 모델
+inline constexpr u32 kInstanceLodShift = 8;    // 에디터 보기 모드 Lod: 비트 8~9 = 그린 LOD 단계
+
+// 에디터 보기 모드 (씬 뷰에서 무엇이 비싼지 색으로). 디버그 UI가 있는 빌드에만 파이프라인이 있고, 출시 빌드는 None만
+enum class DebugView : u8 {
+    None,
+    Wireframe, // 삼각형 선
+    Normals,   // 법선 방향 = 색
+    Lod,       // LOD 0 초록, 1 노랑, 2 빨강
+    Overdraw,  // 같은 픽셀을 그린 횟수 = 밝기 (깊이 시험 없이 더하기)
+    Budget,    // 예산을 넘은 모델 빨강, 나머지 회색
+    Count
+};
 
 constexpr u32 rgba(u8 r, u8 g, u8 b, u8 a = 255) {
     return static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) | (static_cast<u32>(a) << 24);
@@ -47,6 +60,7 @@ struct FrameParams {
     // 화면 전체를 이 색(선형)으로 섞는다 (연출 표의 번쩍임, 엔진이 feedback::Player에서 채운다). 0 = 없음
     Vec3 tintColor{1.0f, 1.0f, 1.0f};
     f32 tintAmount = 0.0f;
+    DebugView debugView = DebugView::None; // 에디터 보기 모드
 };
 
 struct RendererDesc {
@@ -55,6 +69,7 @@ struct RendererDesc {
     u32 height = 0;
     bool vsync = true;
     bool debugLayer = false;
+    bool gpuCapture = false; // --gpu-capture (rhi/GpuCapture.h)
 };
 
 // GPU 조사는 RHI 백엔드가 한다 (출시 exe의 --system-info, 최소 사양 검사)
@@ -148,6 +163,7 @@ public:
     const char* initError() const; // init()이 false일 때 이유
     bool isUma() const;
     const RenderStats& stats() const;
+    bool supportsDebugView(DebugView view) const; // 이 빌드·장치가 그 보기 모드를 그릴 수 있다
     rhi::GpuMemory gpuMemory() const; // 드라이버 질의라 매 프레임 부르지 않는다 (FrameStats는 보고 주기마다)
 
 private:

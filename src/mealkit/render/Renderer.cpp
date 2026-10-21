@@ -34,7 +34,7 @@ struct ForwardPush {
     u32 ring = 0;
     u32 frameOffset = 0;
     u32 instanceOffset = 0;
-    u32 pad = 0;
+    u32 debugView = 0; // render::DebugView (Forward.hlsl PSMain)
 };
 
 struct UiPush {
@@ -60,7 +60,9 @@ struct GpuMesh {
 struct Renderer::Impl {
     rhi::Device device;
     rhi::Pipeline forward;
+    rhi::Pipeline forwardWire, forwardOverdraw; // 에디터 보기 모드 (디버그 UI 빌드만)
     rhi::Pipeline ui;
+    DebugView debugView = DebugView::None;
     rhi::PipelineDesc forwardDesc, uiDesc; // 셰이더 핫 리로드가 바이트코드만 바꿔 다시 만든다
     ShaderReloader shaderReload;
     std::vector<GpuMesh> meshes;
@@ -82,6 +84,20 @@ struct Renderer::Impl {
     Frustum frustum;
     i32 openPass = -1; // 지금 GPU 시간을 재는 패스 (GpuPass, 없으면 -1)
     std::string capturePath;
+
+    rhi::PipelineDesc wireDesc() const {
+        rhi::PipelineDesc d = forwardDesc;
+        d.wireframe = true;
+        d.cullBack = false;
+        return d;
+    }
+    rhi::PipelineDesc overdrawDesc() const {
+        rhi::PipelineDesc d = forwardDesc;
+        d.additiveBlend = true;
+        d.depthTest = false;
+        d.cullBack = false;
+        return d;
+    }
 
     // 기다리던 아틀라스 영역을 이번 프레임 업로드 링으로 복사한다 (자리가 없으면 다음 프레임에)
     void beginPass(GpuPass pass) {
@@ -128,7 +144,7 @@ Renderer::~Renderer() { shutdown(); }
 bool Renderer::init(const RendererDesc& desc) {
     m = new Impl();
     m->vsync = desc.vsync;
-    if (!m->device.init({desc.window, desc.width, desc.height, desc.debugLayer})) return false;
+    if (!m->device.init({desc.window, desc.width, desc.height, desc.debugLayer, desc.gpuCapture})) return false;
 
     rhi::PipelineDesc forward;
     forward.vs = {g_ForwardVS, sizeof(g_ForwardVS)};
@@ -140,6 +156,10 @@ bool Renderer::init(const RendererDesc& desc) {
     forward.target = rhi::Target::Scene;
     m->forward = m->device.createPipeline(forward);
     m->forwardDesc = forward;
+#if MEALKIT_DEBUG_UI
+    m->forwardWire = m->device.createPipeline(m->wireDesc());
+    m->forwardOverdraw = m->device.createPipeline(m->overdrawDesc());
+#endif
 
     rhi::PipelineDesc ui;
     ui.vs = {g_UiVS, sizeof(g_UiVS)};
@@ -154,6 +174,11 @@ bool Renderer::init(const RendererDesc& desc) {
         rhi::PipelineDesc d = m->forwardDesc;
         d.vs = vs;
         d.ps = ps;
+        m->forwardDesc = d; // 보기 모드 파이프라인도 같은 셰이더 (바이트코드는 ShaderReloader가 갖고 있다)
+#if MEALKIT_DEBUG_UI
+        m->device.recreatePipeline(m->forwardWire, m->wireDesc());
+        m->device.recreatePipeline(m->forwardOverdraw, m->overdrawDesc());
+#endif
         return m->device.recreatePipeline(m->forward, d);
     });
     m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
@@ -210,7 +235,9 @@ bool Renderer::beginFrame(const FrameParams& p) {
     rhi::CommandList& cmd = m->device.cmd();
 
     const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // 배경도 번쩍임을 받는다
-    const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
+    m->debugView = supportsDebugView(p.debugView) ? p.debugView : DebugView::None;
+    const bool overdraw = m->debugView == DebugView::Overdraw;
+    const f32 clear[4] = {overdraw ? 0.0f : sky.x, overdraw ? 0.0f : sky.y, overdraw ? 0.0f : sky.z, 1.0f};
     cmd.beginScene(clear, 0.0f); // reversed-Z: 먼 쪽이 0
     m->beginPass(GpuPass::Opaque);
 
@@ -223,7 +250,9 @@ bool Renderer::beginFrame(const FrameParams& p) {
         vh = std::min(p.viewport.height, fullH - vy);
     }
     cmd.setViewport(vx, vy, vw, vh);
-    cmd.setPipeline(m->forward);
+    cmd.setPipeline(m->debugView == DebugView::Wireframe  ? m->forwardWire
+                    : m->debugView == DebugView::Overdraw ? m->forwardOverdraw
+                                                          : m->forward);
 
     FrameConstants fc{};
     std::memcpy(fc.viewProj, p.viewProj.m, sizeof(fc.viewProj));
@@ -269,7 +298,8 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
 
     const GpuMesh& mesh = m->meshes[meshId];
     rhi::CommandList& cmd = m->device.cmd();
-    const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset), 0};
+    const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset),
+                           static_cast<u32>(m->debugView)};
     cmd.pushConstants(&push, sizeof(push));
     cmd.setVertexBuffer(mesh.vertexBuffer, sizeof(Vertex));
     cmd.setIndexBuffer(mesh.indexBuffer);
@@ -385,6 +415,15 @@ const Frustum& Renderer::frustum() const {
 }
 void Renderer::addCulled(u32 count) {
     if (m) m->stats.culled += count;
+}
+bool Renderer::supportsDebugView(DebugView view) const {
+    if (view == DebugView::None) return true;
+    if (!m || view >= DebugView::Count) return false;
+#if MEALKIT_DEBUG_UI
+    return true;
+#else
+    return false; // 출시 빌드: 보기 모드 파이프라인이 없다
+#endif
 }
 rhi::GpuMemory Renderer::gpuMemory() const { return m ? m->device.gpuMemory() : rhi::GpuMemory{}; }
 
