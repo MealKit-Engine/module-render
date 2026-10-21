@@ -61,9 +61,19 @@ using GpuInfo = rhi::GpuInfo;
 using rhi::gpuMinimumError;
 using rhi::queryGpu;
 
+// GPU 패스: 프레임 GPU 시간을 나눠 재는 구간 (벤치마크 보고서의 GPU 예산 표, mealkit.project gpuBudget*).
+// 아직 없는 패스(그림자·포스트·VFX)는 그 기능이 들어올 때 렌더러가 재기 시작한다 (그때까지 0)
+enum class GpuPass : u8 { Opaque, Shadow, Post, Vfx, Ui, Count };
+inline constexpr u32 kGpuPassCount = static_cast<u32>(GpuPass::Count);
+const char* gpuPassName(GpuPass pass); // "opaque", "shadow", ... (보고서·로그, 영어)
+
 struct RenderStats {
     u32 drawCalls = 0;
     u32 instances = 0;
+    // GPU 시간 (타임스탬프): GPU가 끝낸 가장 최근 프레임 값이라 2프레임 늦다. gpuValid가 false면 모른다
+    bool gpuValid = false;
+    f32 gpuFrameMs = 0.0f;
+    f32 gpuPassMs[kGpuPassCount] = {};
 };
 
 // 2D UI 사각형 하나 (HLSL UiQuad와 같은 112바이트, shaders/Ui.hlsl). mealkit/ui/가 채운다. 좌표는 백버퍼 픽셀.
@@ -131,6 +141,7 @@ public:
     const char* initError() const; // init()이 false일 때 이유
     bool isUma() const;
     const RenderStats& stats() const;
+    rhi::GpuMemory gpuMemory() const; // 드라이버 질의라 매 프레임 부르지 않는다 (FrameStats는 보고 주기마다)
 
 private:
     struct Impl;

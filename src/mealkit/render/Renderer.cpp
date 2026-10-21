@@ -75,9 +75,20 @@ struct Renderer::Impl {
     bool inFrame = false;
     bool uploadOverflowWarned = false;
     RenderStats stats;
+    i32 openPass = -1; // 지금 GPU 시간을 재는 패스 (GpuPass, 없으면 -1)
     std::string capturePath;
 
     // 기다리던 아틀라스 영역을 이번 프레임 업로드 링으로 복사한다 (자리가 없으면 다음 프레임에)
+    void beginPass(GpuPass pass) {
+        endPass();
+        openPass = static_cast<i32>(pass);
+        device.cmd().beginTimer(static_cast<u32>(pass));
+    }
+    void endPass() {
+        if (openPass >= 0) device.cmd().endTimer(static_cast<u32>(openPass));
+        openPass = -1;
+    }
+
     void flushUiUploads() {
         rhi::CommandList& cmd = device.cmd();
         size_t done = 0;
@@ -177,6 +188,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // 배경도 번쩍임을 받는다
     const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
     cmd.beginScene(clear, 0.0f); // reversed-Z: 먼 쪽이 0
+    m->beginPass(GpuPass::Opaque);
 
     const f32 fullW = static_cast<f32>(width()), fullH = static_cast<f32>(height());
     f32 vx = 0.0f, vy = 0.0f, vw = fullW, vh = fullH;
@@ -210,6 +222,10 @@ bool Renderer::beginFrame(const FrameParams& p) {
     std::memcpy(cpu, &fc, sizeof(fc)); // 프레임의 첫 할당이라 항상 자리가 있다
 
     m->stats = {};
+    const rhi::GpuTimes& gpu = m->device.gpuTimes();
+    m->stats.gpuValid = gpu.valid;
+    m->stats.gpuFrameMs = gpu.frameMs;
+    for (u32 i = 0; i < kGpuPassCount; ++i) m->stats.gpuPassMs[i] = gpu.timerMs[i];
     m->inFrame = true;
     return true;
 }
@@ -240,6 +256,7 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
 void Renderer::beginOverlay() {
     if (!m || !m->inFrame) return;
     m->device.cmd().beginOverlay();
+    m->beginPass(GpuPass::Ui); // UI + 디버그 UI
 }
 
 void Renderer::updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels) {
@@ -298,6 +315,7 @@ u32 Renderer::height() const { return m ? m->device.height() : 0; }
 
 void Renderer::endFrame() {
     if (!m || !m->inFrame) return;
+    m->endPass();
     if (m->capturePath.empty()) {
         m->device.endFrame(m->vsync);
     } else {
@@ -332,6 +350,18 @@ const char* Renderer::initError() const { return m ? m->device.initError().c_str
 const RenderStats& Renderer::stats() const {
     static const RenderStats empty{};
     return m ? m->stats : empty;
+}
+rhi::GpuMemory Renderer::gpuMemory() const { return m ? m->device.gpuMemory() : rhi::GpuMemory{}; }
+
+const char* gpuPassName(GpuPass pass) {
+    switch (pass) {
+    case GpuPass::Opaque: return "opaque";
+    case GpuPass::Shadow: return "shadow";
+    case GpuPass::Post: return "post";
+    case GpuPass::Vfx: return "vfx";
+    case GpuPass::Ui: return "ui";
+    default: return "?";
+    }
 }
 
 } // namespace mealkit::render
