@@ -42,8 +42,9 @@ struct FrameConstants {
     u32 env[4];          // 하늘 큐브, 반사 큐브 (g_cubes 번호), 반사 밉 수, 있음(1)
     f32 envParams[4];    // 세기, cos(회전), sin(회전), 0
     f32 sh[9][4];        // 환경광 SH (rgb, 0)
+    u32 probes[4];       // 반사 프로브 표의 링 위치, 개수, 0, 0 (표: 프로브마다 위치 xyz, 큐브 번호 | 밉 수 << 24, 상자 반 크기 xyz, 0)
 };
-static_assert(sizeof(FrameConstants) == 464);
+static_assert(sizeof(FrameConstants) == 480);
 
 // 4×4 역행렬 (행 우선, 행 벡터 규칙 그대로). 특이 행렬이면 단위 행렬
 void invert(const f32 m[16], f32 out[16]) {
@@ -140,6 +141,9 @@ struct Renderer::Impl {
         f32 sh[9][3] = {};
     };
     std::vector<Environment> environments; // createEnvironment 번호 - 1
+    std::vector<u32> probes;               // createProbe 번호 - 1 → 큐브 번호 | 밉 수 << 24
+    rhi::RenderTarget captureSource;       // captureTarget (이번 endFrame)
+    Image* captureOut = nullptr;
     void drawSky(const FrameParams& p); // 프레임 상수를 쓴 뒤, 3D 전에 (환경이 없으면 아무것도 하지 않는다)
     LightingModel lighting = LightingModel::Pbr;
     DebugView debugView = DebugView::None;
@@ -512,6 +516,28 @@ void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
         std::memcpy(fc.envParams, params, sizeof(params));
         for (u32 i = 0; i < 9; ++i) std::memcpy(fc.sh[i], e.sh[i], sizeof(e.sh[i]));
     }
+    if (p.probes && p.probeCount) {
+        struct ProbeGpu {
+            f32 position[3];
+            u32 cube;
+            f32 halfExtents[3];
+            u32 pad;
+        };
+        std::vector<ProbeGpu> table;
+        for (u32 i = 0; i < p.probeCount && table.size() < kMaxReflectionProbes; ++i) {
+            const ReflectionProbe& probe = p.probes[i];
+            if (probe.id && probe.id <= probes.size())
+                table.push_back({{probe.position.x, probe.position.y, probe.position.z}, probes[probe.id - 1],
+                                 {probe.halfExtents.x, probe.halfExtents.y, probe.halfExtents.z}, 0});
+        }
+        u64 tableOffset = 0;
+        const u64 bytes = table.size() * sizeof(ProbeGpu);
+        if (u8* cpu = bytes ? device.allocUpload(bytes, kRingAlignment, &tableOffset) : nullptr) {
+            std::memcpy(cpu, table.data(), bytes);
+            fc.probes[0] = static_cast<u32>(tableOffset);
+            fc.probes[1] = static_cast<u32>(table.size());
+        } else if (bytes) warnOverflow(bytes);
+    }
     fc.materials[0] = static_cast<u32>(materialOffset);
     fc.materials[1] = static_cast<u32>(materials.size());
     if (u8* cpu = device.allocUpload(sizeof(fc), kRingAlignment, offset)) std::memcpy(cpu, &fc, sizeof(fc));
@@ -548,6 +574,18 @@ u32 Renderer::createEnvironment(const EnvironmentData& d) {
     std::memcpy(e.sh, d.sh, sizeof(e.sh));
     m->environments.push_back(e);
     return static_cast<u32>(m->environments.size());
+}
+
+u32 Renderer::createProbe(u32 size, u32 mips, const u32* reflect) {
+    if (!m || !reflect || !size || !mips || mips > 255) return 0;
+    rhi::TextureInit init;
+    init.width = init.height = size;
+    init.mipLevels = mips;
+    init.format = rhi::Format::Rgb9e5;
+    init.data = reflect;
+    init.cube = true;
+    m->probes.push_back(createTexture(init) | (mips << 24));
+    return static_cast<u32>(m->probes.size());
 }
 
 rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {
@@ -686,7 +724,15 @@ u32 Renderer::height() const { return m ? m->device.height() : 0; }
 void Renderer::endFrame() {
     if (!m || !m->inFrame) return;
     m->endPass();
-    if (m->capturePath.empty()) {
+    if (m->captureOut) {
+        rhi::Capture capture;
+        capture.source = m->captureSource;
+        m->device.endFrame(m->vsync, &capture);
+        m->captureOut->width = capture.width;
+        m->captureOut->height = capture.height;
+        m->captureOut->rgba = std::move(capture.rgba);
+        m->captureOut = nullptr;
+    } else if (m->capturePath.empty()) {
         m->device.endFrame(m->vsync);
     } else {
         rhi::Capture capture;
@@ -709,6 +755,11 @@ void Renderer::setVsync(bool enabled) {
 bool Renderer::vsync() const { return m && m->vsync; }
 void Renderer::requestCapture(const char* pngPath) {
     if (m) m->capturePath = pngPath;
+}
+void Renderer::captureTarget(rhi::RenderTarget target, Image* out) {
+    if (!m || !target || !out) return;
+    m->captureSource = target;
+    m->captureOut = out;
 }
 const char* Renderer::adapterName() const { return m ? m->device.gpu().adapter.c_str() : ""; }
 bool Renderer::isUma() const { return m && m->device.gpu().uma; }

@@ -99,6 +99,15 @@ struct Viewport {
     f32 x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
 };
 
+// 반사 프로브 하나 (씬의 reflection_probe 물체, asset::ModelCache::probes가 채운다). 물체는 자기 위치를 담은 영향 상자
+// 중 중심이 가장 가까운 프로브 하나의 반사 큐브를 쓴다 (섞지 않음). 어느 상자에도 없으면 하늘 HDRI 반사
+struct ReflectionProbe {
+    Vec3 position;     // 구운 자리 = 영향 상자 중심
+    Vec3 halfExtents;  // 영향 상자 (축 정렬, 월드)
+    u32 id = 0; // Renderer::createProbe 번호 (0 = 없음, 건너뛴다)
+};
+inline constexpr u32 kMaxReflectionProbes = 64; // 셰이더가 물체마다 모두 훑는다 (씬당 한도는 프로젝트 설정 probeMaxCount)
+
 struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
@@ -123,6 +132,9 @@ struct FrameParams {
     u32 environment = 0;
     f32 environmentIntensity = 1.0f;
     f32 environmentRotation = 0.0f;
+    // 반사 프로브 (부르는 쪽 메모리, beginFrame/drawToTarget 동안만 읽는다). kMaxReflectionProbes를 넘으면 앞에서부터
+    const ReflectionProbe* probes = nullptr;
+    u32 probeCount = 0;
 };
 
 // 하늘 HDRI에서 구운 환경 (asset::EnvironmentMap, 큐브는 RGB9E5, 면 +X −X +Y −Y +Z −Z 차례로). createEnvironment가 GPU에 올린다
@@ -214,6 +226,8 @@ public:
 
     // 하늘 HDRI 환경을 GPU에 올리고 번호를 준다 (FrameParams::environment). 지우지 않는다: 같은 HDRI는 쓰는 쪽(ModelCache)이 번호를 다시 쓴다
     u32 createEnvironment(const EnvironmentData& data);
+    // 반사 프로브 큐브 (asset::ProbeMap: RGB9E5, 면마다 밉 0부터)를 올리고 번호를 준다 (ReflectionProbe::id). 지우지 않는다
+    u32 createProbe(u32 size, u32 mips, const u32* reflect);
     // 조명 모델 (프로젝트 설정, game::applyRenderStyle). 파이프라인은 init이 모두 만들어 두어 바로 바뀐다
     void setLightingModel(LightingModel model);
     LightingModel lightingModel() const;
@@ -246,6 +260,9 @@ public:
     void setVsync(bool enabled);
     bool vsync() const;
     void requestCapture(const char* pngPath); // 다음 endFrame에서 백버퍼를 PNG로 저장
+    // 이번 프레임 endFrame에서 오프스크린 대상(drawToTarget으로 그린)을 읽어 out에 둔다 (sRGB 8비트, GPU를 기다린다).
+    // 반사 프로브 굽기. out은 endFrame까지 살아 있어야 한다. 같은 프레임의 requestCapture는 다음 프레임으로 미룬다
+    void captureTarget(rhi::RenderTarget target, Image* out);
 
     const char* adapterName() const;
     const GpuInfo& gpu() const;
