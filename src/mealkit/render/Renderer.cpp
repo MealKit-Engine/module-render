@@ -2,6 +2,7 @@
 
 #include "mealkit/core/Log.h"
 #include "mealkit/platform/Image.h"
+#include "mealkit/render/DrawList.h"
 #include "mealkit/render/ShaderReload.h"
 
 #include <algorithm>
@@ -120,6 +121,9 @@ struct Renderer::Impl {
     std::vector<TextureUpload> uploads; // 아직 GPU에 올리지 않은 영역 (UI 아틀라스, 툰 램프. 차례대로)
 
     u64 frameOffset = 0; // 이번 프레임 FrameConstants의 링 위치
+    u64 materialOffset = 0; // 이번 프레임 머티리얼 표의 링 위치 (본 화면과 오프스크린이 같이)
+    std::vector<std::pair<u32, u32>> targetSizes; // RenderTarget::id → 크기 (drawToTarget의 뷰포트)
+    void writeFrameConstants(const FrameParams& p, u64* offset); // 업로드 링에 쓰고 위치를 offset에
     bool vsync = true;
     bool inFrame = false;
     bool uploadOverflowWarned = false;
@@ -399,6 +403,23 @@ bool Renderer::beginFrame(const FrameParams& p) {
     cmd.setViewport(vx, vy, vw, vh);
     cmd.setPipeline(m->scenePipeline());
 
+    m->materialOffset = 0;
+    const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
+    if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &m->materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
+    else m->warnOverflow(materialBytes);
+    m->writeFrameConstants(p, &m->frameOffset);
+
+    m->stats = {};
+    m->frustum = Frustum::fromViewProj(p.viewProj);
+    const rhi::GpuTimes& gpu = m->device.gpuTimes();
+    m->stats.gpuValid = gpu.valid;
+    m->stats.gpuFrameMs = gpu.frameMs;
+    for (u32 i = 0; i < kGpuPassCount; ++i) m->stats.gpuPassMs[i] = gpu.timerMs[i];
+    m->inFrame = true;
+    return true;
+}
+
+void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
     FrameConstants fc{};
     std::memcpy(fc.viewProj, p.viewProj.m, sizeof(fc.viewProj));
     const Vec3 sun = normalize(p.sunDirection);
@@ -421,24 +442,51 @@ bool Renderer::beginFrame(const FrameParams& p) {
     wind = windLength > 1e-6f ? wind * (1.0f / windLength) : Vec3{1.0f, 0.0f, 0.0f};
     const f32 windValues[4] = {wind.x, wind.z, std::max(p.windStrength, 0.0f), p.time};
     std::memcpy(fc.wind, windValues, sizeof(windValues));
-    fc.style[0] = m->device.textureIndex(m->toonRamp);
-    u8* cpu = m->device.allocUpload(sizeof(fc), kRingAlignment, &m->frameOffset); // 프레임의 첫 할당이라 항상 자리가 있다
-    u64 materialOffset = 0;
-    const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
-    if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
-    else m->warnOverflow(materialBytes);
+    fc.style[0] = device.textureIndex(toonRamp);
     fc.materials[0] = static_cast<u32>(materialOffset);
-    fc.materials[1] = static_cast<u32>(m->materials.size());
-    std::memcpy(cpu, &fc, sizeof(fc));
+    fc.materials[1] = static_cast<u32>(materials.size());
+    if (u8* cpu = device.allocUpload(sizeof(fc), kRingAlignment, offset)) std::memcpy(cpu, &fc, sizeof(fc));
+    else warnOverflow(sizeof(fc));
+}
 
-    m->stats = {};
+rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {
+    if (!m || width == 0 || height == 0) return {};
+    const rhi::RenderTarget target = m->device.createRenderTarget(width, height);
+    m->targetSizes.resize(target.id + 1);
+    m->targetSizes[target.id] = {width, height};
+    return target;
+}
+
+rhi::Texture Renderer::renderTargetTexture(rhi::RenderTarget target) const {
+    return m ? m->device.renderTargetTexture(target) : rhi::Texture{};
+}
+
+void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, const DrawList& list, LightingModel lighting) {
+    if (!m || !m->inFrame || !target || target.id >= m->targetSizes.size()) return;
+    rhi::CommandList& cmd = m->device.cmd();
+    // 본 화면의 상태를 잠시 바꾼다: 프레임 상수·프러스텀·보기 모드 (오프스크린은 늘 조명 그림)
+    const u64 frameOffset = m->frameOffset;
+    const Frustum frustum = m->frustum;
+    const DebugView debugView = m->debugView;
+    const LightingModel projectLighting = m->lighting;
+    m->debugView = DebugView::None;
+    m->lighting = lighting;
+    m->writeFrameConstants(p, &m->frameOffset);
     m->frustum = Frustum::fromViewProj(p.viewProj);
-    const rhi::GpuTimes& gpu = m->device.gpuTimes();
-    m->stats.gpuValid = gpu.valid;
-    m->stats.gpuFrameMs = gpu.frameMs;
-    for (u32 i = 0; i < kGpuPassCount; ++i) m->stats.gpuPassMs[i] = gpu.timerMs[i];
-    m->inFrame = true;
-    return true;
+
+    const Vec3 sky = p.fogColor;
+    const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
+    cmd.beginTarget(target, clear, 0.0f);
+    const auto [w, h] = m->targetSizes[target.id];
+    cmd.setViewport(0.0f, 0.0f, static_cast<f32>(w), static_cast<f32>(h));
+    cmd.setPipeline(m->scenePipeline());
+    list.submit(*this);
+    cmd.endTarget(target);
+
+    m->frameOffset = frameOffset;
+    m->frustum = frustum;
+    m->debugView = debugView;
+    m->lighting = projectLighting;
 }
 
 void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 count) {

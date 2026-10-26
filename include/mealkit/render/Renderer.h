@@ -13,6 +13,7 @@ struct Image;
 
 namespace mealkit::render {
 
+class DrawList;
 using MeshId = u32;
 
 // 머티리얼 (glTF PBR metallic-roughness의 지원 범위, docs/CODING_MODEL.md "모델·머티리얼·텍스처"). 렌더러가 표로 갖고
@@ -207,6 +208,12 @@ public:
     bool beginFrame(const FrameParams& params);
     // 같은 메시의 인스턴스를 드로우 콜 1회로 그린다.
     void drawInstances(MeshId mesh, const InstanceData* instances, u32 count);
+    // 오프스크린 그림 (에디터 룩데브 창): 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
+    rhi::RenderTarget createRenderTarget(u32 width, u32 height);
+    rhi::Texture renderTargetTexture(rhi::RenderTarget target) const; // ImGui::Image (rhi::imguiTextureId)
+    // 본 화면 3D(DrawList::submit) 다음, UI 전에: 대상 전체에 params의 카메라·빛과 lighting 조명 모델로 list를 그린다.
+    // 백버퍼는 풀리므로 이 뒤에 본 화면 3D를 그리지 않는다 (UI는 beginOverlay가 다시 묶는다)
+    void drawToTarget(rhi::RenderTarget target, const FrameParams& params, const DrawList& list, LightingModel lighting);
     // 3D 이후 UI를 그리기 위해 깊이 없는 sRGB 미변환 백버퍼 뷰를 묶는다.
     void beginOverlay();
     // UI 아틀라스의 한 영역을 바꾼다 (언제든, 다음 drawUi 전에 GPU에 올린다). pixels는 w×h, 행 사이 빈틈 없음
