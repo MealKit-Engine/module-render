@@ -43,8 +43,9 @@ struct FrameConstants {
     f32 envParams[4];    // 세기, cos(회전), sin(회전), 0
     f32 sh[9][4];        // 환경광 SH (rgb, 0)
     u32 probes[4];       // 반사 프로브 표의 링 위치, 개수, 0, 0 (표: 프로브마다 위치 xyz, 큐브 번호 | 밉 수 << 24, 상자 반 크기 xyz, 0)
+    u32 lights[4];       // 점광원 표의 링 위치, 개수, 0, 0 (표: 빛마다 위치 xyz, 거리, 색 rgb, 0)
 };
-static_assert(sizeof(FrameConstants) == 480);
+static_assert(sizeof(FrameConstants) == 496);
 
 // 4×4 역행렬 (행 우선, 행 벡터 규칙 그대로). 특이 행렬이면 단위 행렬
 void invert(const f32 m[16], f32 out[16]) {
@@ -104,7 +105,9 @@ struct ForwardPush {
     u32 ring = 0;
     u32 frameOffset = 0;
     u32 instanceOffset = 0;
-    u32 debugView = 0; // render::DebugView (Forward.hlsl PSMain)
+    u32 debugView = 0;   // render::DebugView (Forward.hlsl PSMain)
+    u32 lightOffset = 0; // 인스턴스마다 점광원 번호 8개(8바이트, 0xFF = 끝)의 링 위치 (프레임에 빛이 있을 때만 읽는다)
+    u32 pad[3] = {};
 };
 
 struct UiPush {
@@ -142,6 +145,9 @@ struct Renderer::Impl {
     };
     std::vector<Environment> environments; // createEnvironment 번호 - 1
     std::vector<u32> probes;               // createProbe 번호 - 1 → 큐브 번호 | 밉 수 << 24
+    std::vector<PointLight> frameLights;   // 이번 프레임 상수에 쓴 점광원 (drawInstances가 인스턴스마다 고른다)
+    u32 lightsPerObject = 4;
+    std::vector<u8> lightPicks;            // drawInstances 작업 버퍼
     rhi::RenderTarget captureSource;       // captureTarget (이번 endFrame)
     Image* captureOut = nullptr;
     void drawSky(const FrameParams& p); // 프레임 상수를 쓴 뒤, 3D 전에 (환경이 없으면 아무것도 하지 않는다)
@@ -336,6 +342,10 @@ bool Renderer::init(const RendererDesc& desc) {
     m->toonRamp = m->device.createTexture(kToonRampWidth, 1, rhi::Format::Rgba8Unorm);
     setToonRamp(nullptr);
     return true;
+}
+
+void Renderer::setLightsPerObject(u32 count) {
+    if (m) m->lightsPerObject = std::clamp<u32>(count, 1, kMaxLightsPerObject);
 }
 
 void Renderer::setLightingModel(LightingModel model) {
@@ -538,6 +548,29 @@ void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
             fc.probes[1] = static_cast<u32>(table.size());
         } else if (bytes) warnOverflow(bytes);
     }
+    frameLights.assign(p.lights, p.lights + (p.lights ? std::min(p.lightCount, kMaxPointLights) : 0u));
+    if (!frameLights.empty()) {
+        struct LightGpu {
+            f32 position[3];
+            f32 range;
+            f32 color[3];
+            f32 pad;
+        };
+        std::vector<LightGpu> table;
+        table.reserve(frameLights.size());
+        for (const PointLight& l : frameLights)
+            table.push_back({{l.position.x, l.position.y, l.position.z}, std::max(l.range, 1e-3f), {l.color.x, l.color.y, l.color.z}, 0.0f});
+        u64 tableOffset = 0;
+        const u64 bytes = table.size() * sizeof(LightGpu);
+        if (u8* cpu = device.allocUpload(bytes, kRingAlignment, &tableOffset)) {
+            std::memcpy(cpu, table.data(), bytes);
+            fc.lights[0] = static_cast<u32>(tableOffset);
+            fc.lights[1] = static_cast<u32>(table.size());
+        } else {
+            warnOverflow(bytes);
+            frameLights.clear();
+        }
+    }
     fc.materials[0] = static_cast<u32>(materialOffset);
     fc.materials[1] = static_cast<u32>(materials.size());
     if (u8* cpu = device.allocUpload(sizeof(fc), kRingAlignment, offset)) std::memcpy(cpu, &fc, sizeof(fc));
@@ -548,7 +581,7 @@ void Renderer::Impl::drawSky(const FrameParams& p) {
     if (!p.environment || p.environment > environments.size()) return;
     rhi::CommandList& cmd = device.cmd();
     cmd.setPipeline(sky);
-    const ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), 0, 0};
+    const ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), 0, 0, 0};
     cmd.pushConstants(&push, sizeof(push));
     cmd.draw(3, 1);
     stats.drawCalls += 1;
@@ -608,6 +641,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     const Frustum frustum = m->frustum;
     const DebugView debugView = m->debugView;
     const LightingModel projectLighting = m->lighting;
+    std::vector<PointLight> frameLights = m->frameLights;
     m->debugView = DebugView::None;
     m->lighting = lighting;
     m->writeFrameConstants(p, &m->frameOffset);
@@ -627,6 +661,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     m->frustum = frustum;
     m->debugView = debugView;
     m->lighting = projectLighting;
+    m->frameLights = std::move(frameLights);
 }
 
 void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 count) {
@@ -642,9 +677,50 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
     std::memcpy(cpu, instances, bytes);
 
     const GpuMesh& mesh = m->meshes[meshId];
+    u64 lightOffset = 0;
+    if (!m->frameLights.empty()) { // 점광원: 인스턴스마다 영향이 큰 빛을 고른다 (바운딩 구와 닿는 빛, 중심에서의 밝기 순)
+        m->lightPicks.assign(static_cast<size_t>(count) * kMaxLightsPerObject, 0xFF);
+        struct Pick {
+            f32 score;
+            u32 light;
+        };
+        Pick best[kMaxLightsPerObject];
+        for (u32 i = 0; i < count; ++i) {
+            const InstanceData& inst = instances[i];
+            const Vec3 s = inst.scale;
+            const f32 radius = mesh.bounds.radius * std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+            const Vec3 center =
+                inst.position + rotate(inst.rotation, Vec3{mesh.bounds.center.x * s.x, mesh.bounds.center.y * s.y, mesh.bounds.center.z * s.z});
+            u32 picked = 0;
+            for (u32 l = 0; l < m->frameLights.size(); ++l) {
+                const PointLight& light = m->frameLights[l];
+                const Vec3 d = light.position - center;
+                const f32 dist = std::sqrt(dot(d, d));
+                if (dist > light.range + radius) continue;
+                const f32 near = std::max(dist - radius, 0.0f); // 물체에서 가장 가까운 점
+                const f32 score = (light.color.x + light.color.y + light.color.z) * (1.0f - near / light.range) / (near * near + 1.0f);
+                u32 at = picked < m->lightsPerObject ? picked++ : m->lightsPerObject;
+                if (at == m->lightsPerObject) { // 가득 찼다: 가장 약한 것보다 세면 바꾼다
+                    u32 weakest = 0;
+                    for (u32 k = 1; k < picked; ++k)
+                        if (best[k].score < best[weakest].score) weakest = k;
+                    if (best[weakest].score >= score) continue;
+                    at = weakest;
+                }
+                best[at] = {score, l};
+            }
+            for (u32 k = 0; k < picked; ++k) m->lightPicks[static_cast<size_t>(i) * kMaxLightsPerObject + k] = static_cast<u8>(best[k].light);
+        }
+        if (u8* dst = m->device.allocUpload(m->lightPicks.size(), kRingAlignment, &lightOffset)) {
+            std::memcpy(dst, m->lightPicks.data(), m->lightPicks.size());
+        } else {
+            m->warnOverflow(m->lightPicks.size());
+            return;
+        }
+    }
     rhi::CommandList& cmd = m->device.cmd();
     const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset),
-                           static_cast<u32>(m->debugView)};
+                           static_cast<u32>(m->debugView), static_cast<u32>(lightOffset)};
     cmd.pushConstants(&push, sizeof(push));
     cmd.setVertexBuffer(mesh.vertexBuffer, sizeof(Vertex));
     cmd.setIndexBuffer(mesh.indexBuffer);

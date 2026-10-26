@@ -5,6 +5,7 @@
 #include "mealkit/render/Mesh.h"
 #include "mealkit/rhi/Rhi.h"
 
+#include <cmath>
 #include <string>
 
 namespace mealkit {
@@ -108,6 +109,16 @@ struct ReflectionProbe {
 };
 inline constexpr u32 kMaxReflectionProbes = 64; // 셰이더가 물체마다 모두 훑는다 (씬당 한도는 프로젝트 설정 probeMaxCount)
 
+// 점광원 하나 (씬의 point_light 물체 = render::addSceneLights, 화면 쪽 효과의 잠깐 빛은 view/가 더한다). 그림자는 없다.
+// 렌더러가 물체(인스턴스)마다 영향이 큰 빛을 CPU로 최대 setLightsPerObject개 골라 셰이더에 번호를 넘긴다
+struct PointLight {
+    Vec3 position;
+    f32 range = 6.0f;   // 이 거리에서 0이 된다 (미터)
+    Vec3 color{1, 1, 1}; // 선형 색 × 세기
+};
+inline constexpr u32 kMaxPointLights = 255;      // 프레임당 (번호 8비트, 넘으면 앞에서부터)
+inline constexpr u32 kMaxLightsPerObject = 8;    // 인스턴스마다 번호 8개 (8바이트)
+
 struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
@@ -135,6 +146,9 @@ struct FrameParams {
     // 반사 프로브 (부르는 쪽 메모리, beginFrame/drawToTarget 동안만 읽는다). kMaxReflectionProbes를 넘으면 앞에서부터
     const ReflectionProbe* probes = nullptr;
     u32 probeCount = 0;
+    // 점광원 (부르는 쪽 메모리, 프레임 동안 읽는다). kMaxPointLights를 넘으면 앞에서부터
+    const PointLight* lights = nullptr;
+    u32 lightCount = 0;
 };
 
 // 하늘 HDRI에서 구운 환경 (asset::EnvironmentMap, 큐브는 RGB9E5, 면 +X −X +Y −Y +Z −Z 차례로). createEnvironment가 GPU에 올린다
@@ -233,6 +247,8 @@ public:
     LightingModel lightingModel() const;
     // 툰 램프: 가로 그림의 왼쪽(어두운 면) → 오른쪽(밝은 면) 색을 확산 조명에 곱한다 (첫 줄만 쓴다). nullptr = 엔진 기본 3단계
     void setToonRamp(const Image* ramp);
+    // 물체마다 쓰는 점광원 수 (프로젝트 설정 pointLightsPerObject, 1..kMaxLightsPerObject, 기본 4)
+    void setLightsPerObject(u32 count);
 
     // false면 이번 프레임은 그리지 않는다 (최소화 등).
     bool beginFrame(const FrameParams& params);
