@@ -22,8 +22,10 @@ public:
     ShaderReloader(const ShaderReloader&) = delete;
     ShaderReloader& operator=(const ShaderReloader&) = delete;
 
-    // engine/shaders/<file>의 VSMain + PSMain
-    void add(const char* file, Apply apply);
+    // engine/shaders/<file>의 정점·픽셀 진입점 (기본 VSMain + PSMain). defines는 "LIGHTING_MODEL=1"처럼 정의 하나 (CMakeLists의
+    // mealkit_shader 변형과 같게, 비면 없음)
+    void add(const char* file, Apply apply, const char* vsEntry = "VSMain", const char* psEntry = "PSMain",
+             const char* defines = "");
     // 매 프레임, 프레임 밖에서. 0.5초마다 파일 시각을 보고, 컴파일은 프로세스로 돌려 기다리지 않는다
     void update();
     bool enabled() const;

@@ -7,6 +7,10 @@
 
 #include <string>
 
+namespace mealkit {
+struct Image;
+}
+
 namespace mealkit::render {
 
 using MeshId = u32;
@@ -14,6 +18,19 @@ using MeshId = u32;
 // 머티리얼 (glTF PBR metallic-roughness의 지원 범위, docs/CODING_MODEL.md "모델·머티리얼·텍스처"). 렌더러가 표로 갖고
 // 프레임마다 업로드 링에 쓴다 (shaders/Forward.hlsl Material, 64바이트). 텍스처는 bindless 번호 (kNoTexture = 없음)
 inline constexpr u32 kNoTexture = 0xFFFFFFFFu;
+
+// 조명 모델 (스타일 프리셋, docs/CODING_MODEL.md "셰이더 코드"): 프로젝트 설정 lightingModel 하나가 게임 전체를 정한다.
+// 셰이더는 모델마다 하나씩 빌드 때 컴파일되고, 렌더러가 init에서 파이프라인을 모두 만든다 (바꿔도 끊기지 않는다)
+enum class LightingModel : u8 { Pbr, Toon, Unlit }; // 프로젝트 설정 game::LightingModelSetting과 같은 순서
+inline constexpr u32 kLightingModelCount = 3;
+
+// 머티리얼 기능 (glTF extras "mealkit_<키>", asset::modelSchemaJson의 materialFeatures). 셰이더 변형이 아니라
+// 머티리얼 표의 비트로 셰이더 안에서 고른다: 한 메시에 기능이 다른 머티리얼이 섞여도 드로우 콜 1회 그대로
+inline constexpr u32 kMaterialOutline = 1u;  // 외곽선: 뒤집은 껍질 패스 (메시에 하나라도 있으면 그 메시를 한 번 더 그린다)
+inline constexpr u32 kMaterialWind = 2u;     // 바람 흔들림: 세기는 정점 색 알파로 칠한다 (알파 없는 모델은 1)
+inline constexpr u32 kMaterialRim = 4u;      // 림 라이트: 가장자리가 밝아진다
+inline constexpr u32 kMaterialDissolve = 8u; // 디졸브: 인스턴스의 디졸브 진행도(instanceDissolve)만큼 사라진다
+
 struct MaterialData {
     f32 baseColor[4] = {1, 1, 1, 1}; // 선형
     f32 emissive[3] = {0, 0, 0};
@@ -25,6 +42,15 @@ struct MaterialData {
     u32 normalTexture = kNoTexture;
     u32 metallicRoughnessTexture = kNoTexture; // G = 거칠기, B = 금속 (glTF)
     u32 emissiveTexture = kNoTexture;
+    // 스타일 프리셋 머티리얼 기능 (kMaterial* 비트와 값). 색은 선형
+    u32 features = 0;
+    f32 outlineWidth = 0.02f; // 미터 (월드 단위, 인스턴스 크기와 무관)
+    f32 outlineColor[3] = {0, 0, 0};
+    f32 windStrength = 0.1f;  // 미터 (정점 알파 1, FrameParams::windStrength 1일 때 흔들리는 폭)
+    f32 rimStrength = 0.5f;
+    f32 rimColor[3] = {1, 1, 1};
+    f32 dissolveEdge = 0.05f; // 사라지는 경계의 빛나는 폭 (진행도 단위 0..1)
+    f32 dissolveColor[3] = {4.0f, 1.6f, 0.4f}; // 경계 발광 (선형, 1보다 크면 더 밝다)
 };
 
 // GPU로 그대로 복사되는 인스턴스 데이터 (HLSL Instance 구조체와 동일한 48바이트).
@@ -41,6 +67,15 @@ inline constexpr u32 kInstanceChecker = 1u;   // 바닥용 체커 패턴
 inline constexpr u32 kInstanceHighlight = 2u; // 에디터 선택 강조
 inline constexpr u32 kInstanceOverBudget = 4u; // 에디터 보기 모드 Budget: 에셋 예산을 넘은 모델
 inline constexpr u32 kInstanceLodShift = 8;    // 에디터 보기 모드 Lod: 비트 8~9 = 그린 LOD 단계
+// 인스턴스마다 바뀌는 스타일 값 (flags 위 16비트, 인스턴스는 48바이트 그대로): view/가 틱 이벤트로 바꾼다
+inline constexpr u32 kInstanceFlashShift = 16;    // 비트 16~23: 번쩍임 0..1 (흰색으로 섞는다, 모든 머티리얼)
+inline constexpr u32 kInstanceDissolveShift = 24; // 비트 24~31: 디졸브 진행도 0..1 (kMaterialDissolve 머티리얼만)
+inline u32 instanceUnit8(f32 amount) { return static_cast<u32>((amount < 0.0f ? 0.0f : amount > 1.0f ? 1.0f : amount) * 255.0f + 0.5f); }
+// flags에 번쩍임을 넣는다: out.add(mesh, {..., instanceFlash(flags, 0.8f)})
+inline u32 instanceFlash(u32 flags, f32 amount) { return (flags & ~(0xFFu << kInstanceFlashShift)) | (instanceUnit8(amount) << kInstanceFlashShift); }
+inline u32 instanceDissolve(u32 flags, f32 progress) {
+    return (flags & ~(0xFFu << kInstanceDissolveShift)) | (instanceUnit8(progress) << kInstanceDissolveShift);
+}
 
 // 에디터 보기 모드 (씬 뷰에서 무엇이 비싼지 색으로). 디버그 UI가 있는 빌드에만 파이프라인이 있고, 출시 빌드는 None만
 enum class DebugView : u8 {
@@ -50,6 +85,7 @@ enum class DebugView : u8 {
     Lod,       // LOD 0 초록, 1 노랑, 2 빨강
     Overdraw,  // 같은 픽셀을 그린 횟수 = 밝기 (깊이 시험 없이 더하기)
     Budget,    // 예산을 넘은 모델 빨강, 나머지 회색
+    Features,  // 머티리얼 기능: 외곽선 빨강, 바람 초록, 림 파랑, 디졸브 노랑 (섞이면 더한 색), 없음 회색
     Count
 };
 
@@ -77,6 +113,10 @@ struct FrameParams {
     Vec3 tintColor{1.0f, 1.0f, 1.0f};
     f32 tintAmount = 0.0f;
     DebugView debugView = DebugView::None; // 에디터 보기 모드
+    // 화면 시간 (초, 바람 흔들림). 그래픽 회귀 테스트는 0으로 둔다
+    f32 time = 0.0f;
+    Vec3 windDirection{1.0f, 0.0f, 0.3f}; // 수평 방향 (정규화는 렌더러가 한다)
+    f32 windStrength = 1.0f;              // 머티리얼 windStrength에 곱한다 (0 = 바람 없음)
 };
 
 struct RendererDesc {
@@ -156,6 +196,12 @@ public:
     // 이번 프레임 viewProj의 프러스텀 (beginFrame이 만든다). DrawList::submit이 인스턴스를 거른다
     const Frustum& frustum() const;
     void addCulled(u32 count); // 통계용 (DrawList::submit)
+
+    // 조명 모델 (프로젝트 설정, game::applyRenderStyle). 파이프라인은 init이 모두 만들어 두어 바로 바뀐다
+    void setLightingModel(LightingModel model);
+    LightingModel lightingModel() const;
+    // 툰 램프: 가로 그림의 왼쪽(어두운 면) → 오른쪽(밝은 면) 색을 확산 조명에 곱한다 (첫 줄만 쓴다). nullptr = 엔진 기본 3단계
+    void setToonRamp(const Image* ramp);
 
     // false면 이번 프레임은 그리지 않는다 (최소화 등).
     bool beginFrame(const FrameParams& params);
