@@ -119,6 +119,16 @@ struct PointLight {
 inline constexpr u32 kMaxPointLights = 255;      // 프레임당 (번호 8비트, 넘으면 앞에서부터)
 inline constexpr u32 kMaxLightsPerObject = 8;    // 인스턴스마다 번호 8개 (8바이트)
 
+// 태양 그림자 (CSM, docs/ROADMAP.md 2단계 "그림자"): 카메라 앞 distance까지를 단계 1~2개로 나눠 단계마다 size² 그림자 맵.
+// 프로젝트 설정 shadows*가 정한다(game::applyRenderStyle). 점광원은 그림자가 없다
+struct ShadowSettings {
+    bool enabled = true;
+    u32 cascades = 2;     // 1 또는 2
+    u32 size = 1024;      // 단계 하나의 그림자 맵 크기 (512..4096)
+    f32 distance = 40.0f; // 카메라에서 이 거리(미터)까지 그림자 (끝 10%에서 옅어진다)
+};
+inline constexpr u32 kMaxShadowCascades = 2;
+
 struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
@@ -249,6 +259,12 @@ public:
     void setToonRamp(const Image* ramp);
     // 물체마다 쓰는 점광원 수 (프로젝트 설정 pointLightsPerObject, 1..kMaxLightsPerObject, 기본 4)
     void setLightsPerObject(u32 count);
+    // 태양 그림자 (프로젝트 설정). 크기·단계 수가 바뀌면 그림자 맵을 새로 만든다 (옛 것은 남는다)
+    void setShadows(const ShadowSettings& shadows);
+    const ShadowSettings& shadows() const;
+    // 그림자 패스: DrawList::submit이 본 화면 3D보다 먼저 부른다 (이 프레임에 한 번, 그림자가 꺼졌으면 아무것도 하지 않는다).
+    // 프러스텀 컬링 전의 모든 인스턴스가 그림자를 드리운다 (단계마다 빛 쪽 상자로 거른다)
+    void drawShadows(const DrawList& list);
 
     // false면 이번 프레임은 그리지 않는다 (최소화 등).
     bool beginFrame(const FrameParams& params);

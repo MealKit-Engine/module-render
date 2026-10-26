@@ -23,6 +23,7 @@ public:
     }
 
     void submit(Renderer& renderer) const {
+        renderer.drawShadows(*this); // 그림자 맵 먼저 (본 화면을 묶기 전에)
         const Frustum& frustum = renderer.frustum();
         for (size_t mesh = 0; mesh < m_buckets.size(); ++mesh) {
             const auto& bucket = m_buckets[mesh];
@@ -40,6 +41,9 @@ public:
                 renderer.drawInstances(static_cast<MeshId>(mesh), m_visible.data(), static_cast<u32>(m_visible.size()));
         }
     }
+
+    // 메시 번호 = 칸 번호 (그림자 패스가 읽는다)
+    const std::vector<std::vector<InstanceData>>& buckets() const { return m_buckets; }
 
 private:
     std::vector<std::vector<InstanceData>> m_buckets;

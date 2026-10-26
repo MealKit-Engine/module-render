@@ -17,6 +17,8 @@
 #include "g_ForwardVS.h"
 #include "g_OutlinePS.h"
 #include "g_OutlineVS.h"
+#include "g_ShadowPS.h"
+#include "g_ShadowVS.h"
 #include "g_SkyPS.h"
 #include "g_SkyVS.h"
 #include "g_UiPS.h"
@@ -44,8 +46,12 @@ struct FrameConstants {
     f32 sh[9][4];        // 환경광 SH (rgb, 0)
     u32 probes[4];       // 반사 프로브 표의 링 위치, 개수, 0, 0 (표: 프로브마다 위치 xyz, 큐브 번호 | 밉 수 << 24, 상자 반 크기 xyz, 0)
     u32 lights[4];       // 점광원 표의 링 위치, 개수, 0, 0 (표: 빛마다 위치 xyz, 거리, 색 rgb, 0)
+    f32 shadowViewProj[kMaxShadowCascades][16]; // 단계마다 월드 → 그림자 클립 (행 우선)
+    f32 shadowForward[4]; // 카메라 앞 방향 xyz (단계 고르기: 앞 방향 거리), 0
+    f32 shadowSplits[4];  // 단계 0 끝 거리, 마지막 단계 끝 거리, 단계 0·1 텍셀의 월드 크기 (법선 밀기)
+    u32 shadow[4];        // 그림자 맵 텍스처 (bindless), 단계 수 (0 = 그림자 없음), 단계 하나 크기, 0
 };
-static_assert(sizeof(FrameConstants) == 496);
+static_assert(sizeof(FrameConstants) == 672);
 
 // 4×4 역행렬 (행 우선, 행 벡터 규칙 그대로). 특이 행렬이면 단위 행렬
 void invert(const f32 m[16], f32 out[16]) {
@@ -148,6 +154,26 @@ struct Renderer::Impl {
     std::vector<PointLight> frameLights;   // 이번 프레임 상수에 쓴 점광원 (drawInstances가 인스턴스마다 고른다)
     u32 lightsPerObject = 4;
     std::vector<u8> lightPicks;            // drawInstances 작업 버퍼
+
+    // 태양 그림자: 단계들을 가로로 붙인 깊이 아틀라스 하나 (단계 i는 x = i × size)
+    ShadowSettings shadowSettings;
+    rhi::RenderTarget shadowTarget;
+    u32 shadowTargetSize = 0, shadowTargetCascades = 0;
+    rhi::Pipeline shadowPipeline;
+    rhi::PipelineDesc shadowDesc;
+    u32 shadowCascades = 0;                    // 이번 프레임 (0 = 그리지 않는다)
+    Mat4 shadowViewProj[kMaxShadowCascades];
+    u64 shadowFrameOffsets[kMaxShadowCascades] = {}; // 단계마다 viewProj만 바꾼 프레임 상수
+    bool shadowPending = false;                // 이번 프레임 그림자 맵을 아직 그리지 않았다
+    void computeCascades(const FrameParams& p, FrameConstants& fc);
+
+    // 본 화면 3D 대상은 처음 그릴 때 묶는다 (그림자 패스가 먼저 다른 대상에 그릴 수 있게)
+    bool sceneBound = false;
+    f32 sceneClear[4] = {};
+    f32 sceneViewport[4] = {};
+    bool sceneSky = false;
+    FrameParams sceneParams; // drawSky가 보는 환경 (포인터 필드는 쓰지 않는다)
+    void ensureScene();
     rhi::RenderTarget captureSource;       // captureTarget (이번 endFrame)
     Image* captureOut = nullptr;
     void drawSky(const FrameParams& p); // 프레임 상수를 쓴 뒤, 3D 전에 (환경이 없으면 아무것도 하지 않는다)
@@ -174,7 +200,8 @@ struct Renderer::Impl {
     u64 frameOffset = 0; // 이번 프레임 FrameConstants의 링 위치
     u64 materialOffset = 0; // 이번 프레임 머티리얼 표의 링 위치 (본 화면과 오프스크린이 같이)
     std::vector<std::pair<u32, u32>> targetSizes; // RenderTarget::id → 크기 (drawToTarget의 뷰포트)
-    void writeFrameConstants(const FrameParams& p, u64* offset); // 업로드 링에 쓰고 위치를 offset에
+    // 업로드 링에 쓰고 위치를 offset에. withShadows: 본 화면 (태양 그림자 단계를 정해 넣는다)
+    void writeFrameConstants(const FrameParams& p, u64* offset, bool withShadows);
     bool vsync = true;
     bool inFrame = false;
     bool uploadOverflowWarned = false;
@@ -329,6 +356,23 @@ bool Renderer::init(const RendererDesc& desc) {
             return m->device.recreatePipeline(m->sky, d);
         },
         "VSSky", "PSSky");
+    rhi::PipelineDesc shadow = forward; // 그림자: 같은 정점 형식, 깊이만 (알파 마스크·디졸브만 픽셀 셰이더에서 버린다)
+    shadow.vs = {g_ShadowVS, sizeof(g_ShadowVS)};
+    shadow.ps = {g_ShadowPS, sizeof(g_ShadowPS)};
+    shadow.target = rhi::Target::Shadow;
+    shadow.cullBack = false; // 양면: 얇은 물체와 열린 모델도 그림자가 빈틈없다 (빛 새는 것은 법선 밀기가 막는다)
+    m->shadowDesc = shadow;
+    m->shadowPipeline = m->device.createPipeline(shadow);
+    m->shaderReload.add(
+        "Forward.hlsl",
+        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+            rhi::PipelineDesc d = m->shadowDesc;
+            d.vs = vs;
+            d.ps = ps;
+            m->shadowDesc = d;
+            return m->device.recreatePipeline(m->shadowPipeline, d);
+        },
+        "VSShadow", "PSShadow");
     m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
         rhi::PipelineDesc d = m->uiDesc;
         d.vs = vs;
@@ -342,6 +386,19 @@ bool Renderer::init(const RendererDesc& desc) {
     m->toonRamp = m->device.createTexture(kToonRampWidth, 1, rhi::Format::Rgba8Unorm);
     setToonRamp(nullptr);
     return true;
+}
+
+void Renderer::setShadows(const ShadowSettings& shadows) {
+    if (!m) return;
+    m->shadowSettings = shadows;
+    m->shadowSettings.cascades = std::clamp<u32>(shadows.cascades, 1, kMaxShadowCascades);
+    m->shadowSettings.size = std::clamp<u32>(shadows.size, 512, 4096);
+    m->shadowSettings.distance = std::max(shadows.distance, 1.0f);
+}
+
+const ShadowSettings& Renderer::shadows() const {
+    static const ShadowSettings none{};
+    return m ? m->shadowSettings : none;
 }
 
 void Renderer::setLightsPerObject(u32 count) {
@@ -462,8 +519,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     const bool overdraw = m->debugView == DebugView::Overdraw;
     const f32 clear[4] = {overdraw ? 0.0f : sky.x, overdraw ? 0.0f : sky.y, overdraw ? 0.0f : sky.z, 1.0f};
     m->flushUploads(); // 툰 램프·UI 아틀라스 (복사는 그리기 대상을 묶기 전에)
-    cmd.beginScene(clear, 0.0f); // reversed-Z: 먼 쪽이 0
-    m->beginPass(GpuPass::Opaque);
+    std::memcpy(m->sceneClear, clear, sizeof(clear));
 
     const f32 fullW = static_cast<f32>(width()), fullH = static_cast<f32>(height());
     f32 vx = 0.0f, vy = 0.0f, vw = fullW, vh = fullH;
@@ -473,15 +529,35 @@ bool Renderer::beginFrame(const FrameParams& p) {
         vw = std::min(p.viewport.width, fullW - vx);
         vh = std::min(p.viewport.height, fullH - vy);
     }
-    cmd.setViewport(vx, vy, vw, vh);
+    const f32 viewport[4] = {vx, vy, vw, vh};
+    std::memcpy(m->sceneViewport, viewport, sizeof(viewport));
+    (void)cmd;
 
     m->materialOffset = 0;
     const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
     if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &m->materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
     else m->warnOverflow(materialBytes);
-    m->writeFrameConstants(p, &m->frameOffset);
-    if (!overdraw) m->drawSky(p);
-    cmd.setPipeline(m->scenePipeline());
+    m->shadowCascades = 0;
+    m->writeFrameConstants(p, &m->frameOffset, true); // 그림자 단계도 정한다 (shadowCascades)
+    if (m->shadowCascades) { // 단계마다 viewProj만 바꾼 프레임 상수 (그림자 패스의 정점 셰이더)
+        FrameParams sp = p;
+        sp.lights = nullptr;
+        sp.lightCount = 0;
+        sp.probes = nullptr;
+        sp.probeCount = 0;
+        const std::vector<PointLight> frameLights = m->frameLights;
+        for (u32 c = 0; c < m->shadowCascades; ++c) {
+            sp.viewProj = m->shadowViewProj[c];
+            m->writeFrameConstants(sp, &m->shadowFrameOffsets[c], false);
+        }
+        m->frameLights = frameLights;
+    }
+    m->shadowPending = m->shadowCascades != 0;
+    m->sceneBound = false;
+    m->sceneSky = !overdraw;
+    m->sceneParams = p;
+    m->sceneParams.probes = nullptr;
+    m->sceneParams.lights = nullptr;
 
     m->stats = {};
     m->frustum = Frustum::fromViewProj(p.viewProj);
@@ -493,7 +569,136 @@ bool Renderer::beginFrame(const FrameParams& p) {
     return true;
 }
 
-void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
+void Renderer::Impl::ensureScene() {
+    if (sceneBound) return;
+    sceneBound = true;
+    shadowPending = false; // 본 화면을 묶은 뒤에는 그림자 맵을 그리지 않는다 (이번 프레임은 비었거나 그린 것)
+    rhi::CommandList& cmd = device.cmd();
+    beginPass(GpuPass::Opaque);
+    cmd.beginScene(sceneClear, 0.0f); // reversed-Z: 먼 쪽이 0
+    cmd.setViewport(sceneViewport[0], sceneViewport[1], sceneViewport[2], sceneViewport[3]);
+    if (sceneSky) drawSky(sceneParams);
+    cmd.setPipeline(scenePipeline());
+}
+
+// 4×4 행렬로 점 하나 (행 벡터 규칙, w로 나눈다)
+static Vec3 transformPoint(const f32 m[16], Vec3 v) {
+    const f32 x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12];
+    const f32 y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
+    const f32 z = v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14];
+    const f32 w = v.x * m[3] + v.y * m[7] + v.z * m[11] + m[15];
+    return Vec3{x, y, z} * (1.0f / w);
+}
+
+// 단계 나누기 (docs/DECISIONS.md 2026-10-27 그림자): 카메라 조각마다 감싸는 구 → 빛 방향 정사영. 구 반지름과 중심을 텍셀 단위로
+// 맞춰 카메라가 돌거나 움직여도 그림자 가장자리가 떨리지 않는다. 빛 쪽으로 100 m를 더 잡아 화면 밖 물체의 그림자도 받는다
+void Renderer::Impl::computeCascades(const FrameParams& p, FrameConstants& fc) {
+    const ShadowSettings& s = shadowSettings;
+    if (!s.enabled || debugView != DebugView::None || !shadowPipeline) return;
+    const u32 cascades = s.cascades, size = s.size;
+    if (!shadowTarget || shadowTargetSize != size || shadowTargetCascades != cascades) {
+        shadowTarget = device.createDepthTarget(size * cascades, size);
+        shadowTargetSize = size;
+        shadowTargetCascades = cascades;
+    }
+    f32 inv[16];
+    invert(&p.viewProj.m[0][0], inv);
+    const Vec3 eye = p.cameraPos;
+    const Vec3 ahead = normalize(transformPoint(inv, {0.0f, 0.0f, 1.0f}) - eye); // 가까운 면 가운데 (reversed-Z)
+    Vec3 rays[4];
+    const f32 corners[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+    for (u32 i = 0; i < 4; ++i) {
+        const Vec3 d = normalize(transformPoint(inv, {corners[i][0], corners[i][1], 1.0f}) - eye);
+        rays[i] = d * (1.0f / std::max(dot(d, ahead), 1e-3f)); // 앞 방향 거리 1당 이동
+    }
+    const f32 splits[kMaxShadowCascades + 1] = {0.0f, cascades == 1 ? s.distance : s.distance * 0.25f, s.distance};
+    const Vec3 toSun = normalize(p.sunDirection);
+    const Vec3 up = std::abs(toSun.y) > 0.99f ? Vec3{0, 0, 1} : Vec3{0, 1, 0};
+    const Mat4 lightView = lookAtLH({}, toSun * -1.0f, up); // 원점에서 빛 방향을 본다 (위치는 정사영 상자가 정한다)
+    for (u32 c = 0; c < cascades; ++c) {
+        Vec3 points[8];
+        for (u32 i = 0; i < 4; ++i) {
+            points[i] = eye + rays[i] * std::max(splits[c], 0.1f);
+            points[4 + i] = eye + rays[i] * splits[c + 1];
+        }
+        Vec3 center{};
+        for (const Vec3& q : points) center = center + q * 0.125f;
+        f32 radius = 0.0f;
+        for (const Vec3& q : points) radius = std::max(radius, length(q - center));
+        radius = std::ceil(radius * 16.0f) / 16.0f;
+        const f32 texel = 2.0f * radius / static_cast<f32>(size);
+        Vec3 c0 = transformPoint(&lightView.m[0][0], center);
+        c0.x = std::floor(c0.x / texel) * texel;
+        c0.y = std::floor(c0.y / texel) * texel;
+        const f32 zNear = c0.z - radius - 100.0f, zFar = c0.z + radius;
+        Mat4 ortho; // 정사영 (reversed-Z: 가까운 면 1, 먼 면 0)
+        ortho.m[0][0] = 1.0f / radius;
+        ortho.m[1][1] = 1.0f / radius;
+        ortho.m[2][2] = -1.0f / (zFar - zNear);
+        ortho.m[3][0] = -c0.x / radius;
+        ortho.m[3][1] = -c0.y / radius;
+        ortho.m[3][2] = zFar / (zFar - zNear);
+        ortho.m[3][3] = 1.0f;
+        shadowViewProj[c] = lightView * ortho;
+        std::memcpy(fc.shadowViewProj[c], &shadowViewProj[c].m[0][0], sizeof(fc.shadowViewProj[c]));
+        fc.shadowSplits[2 + c] = texel;
+    }
+    const f32 fwd[4] = {ahead.x, ahead.y, ahead.z, 0.0f};
+    std::memcpy(fc.shadowForward, fwd, sizeof(fwd));
+    fc.shadowSplits[0] = splits[1];
+    fc.shadowSplits[1] = s.distance;
+    fc.shadow[0] = device.textureIndex(device.renderTargetTexture(shadowTarget));
+    fc.shadow[1] = cascades;
+    fc.shadow[2] = size;
+    shadowCascades = cascades;
+}
+
+void Renderer::drawShadows(const DrawList& list) {
+    if (!m || !m->inFrame || !m->shadowPending || m->sceneBound) return;
+    m->shadowPending = false;
+    rhi::CommandList& cmd = m->device.cmd();
+    m->beginPass(GpuPass::Shadow);
+    const f32 none[4] = {};
+    cmd.beginTarget(m->shadowTarget, none, 0.0f);
+    cmd.setPipeline(m->shadowPipeline);
+    const f32 size = static_cast<f32>(m->shadowTargetSize);
+    std::vector<InstanceData> visible;
+    for (u32 c = 0; c < m->shadowCascades; ++c) {
+        cmd.setViewport(size * static_cast<f32>(c), 0.0f, size, size);
+        const Frustum frustum = Frustum::fromViewProj(m->shadowViewProj[c]);
+        const auto& buckets = list.buckets();
+        for (size_t mesh = 0; mesh < buckets.size() && mesh < m->meshes.size(); ++mesh) {
+            if (buckets[mesh].empty()) continue;
+            const BoundingSphere b = m->meshes[mesh].bounds;
+            visible.clear();
+            for (const InstanceData& inst : buckets[mesh]) {
+                const Vec3 s = inst.scale;
+                const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+                const Vec3 center = inst.position + rotate(inst.rotation, Vec3{b.center.x * s.x, b.center.y * s.y, b.center.z * s.z});
+                if (frustum.sphereVisible(center, b.radius * scale)) visible.push_back(inst);
+            }
+            if (visible.empty()) continue;
+            const u64 bytes = visible.size() * sizeof(InstanceData);
+            u64 offset = 0;
+            u8* cpu = m->device.allocUpload(bytes, kRingAlignment, &offset);
+            if (!cpu) {
+                m->warnOverflow(bytes);
+                continue;
+            }
+            std::memcpy(cpu, visible.data(), bytes);
+            const GpuMesh& gm = m->meshes[mesh];
+            const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(offset), 0, 0};
+            cmd.pushConstants(&push, sizeof(push));
+            cmd.setVertexBuffer(gm.vertexBuffer, sizeof(Vertex));
+            cmd.setIndexBuffer(gm.indexBuffer);
+            cmd.drawIndexed(gm.indexCount, static_cast<u32>(visible.size()));
+            m->stats.drawCalls += 1;
+        }
+    }
+    cmd.endTarget(m->shadowTarget);
+}
+
+void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset, bool withShadows) {
     FrameConstants fc{};
     std::memcpy(fc.viewProj, p.viewProj.m, sizeof(fc.viewProj));
     const Vec3 sun = normalize(p.sunDirection);
@@ -571,6 +776,7 @@ void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
             frameLights.clear();
         }
     }
+    if (withShadows) computeCascades(p, fc);
     fc.materials[0] = static_cast<u32>(materialOffset);
     fc.materials[1] = static_cast<u32>(materials.size());
     if (u8* cpu = device.allocUpload(sizeof(fc), kRingAlignment, offset)) std::memcpy(cpu, &fc, sizeof(fc));
@@ -635,6 +841,7 @@ rhi::Texture Renderer::renderTargetTexture(rhi::RenderTarget target) const {
 
 void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, const DrawList& list, LightingModel lighting) {
     if (!m || !m->inFrame || !target || target.id >= m->targetSizes.size()) return;
+    m->ensureScene(); // 본 화면이 아직 지워지지 않았으면 먼저 (이 뒤로 본 화면 3D는 그리지 않는다)
     rhi::CommandList& cmd = m->device.cmd();
     // 본 화면의 상태를 잠시 바꾼다: 프레임 상수·프러스텀·보기 모드 (오프스크린은 늘 조명 그림)
     const u64 frameOffset = m->frameOffset;
@@ -644,7 +851,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     std::vector<PointLight> frameLights = m->frameLights;
     m->debugView = DebugView::None;
     m->lighting = lighting;
-    m->writeFrameConstants(p, &m->frameOffset);
+    m->writeFrameConstants(p, &m->frameOffset, false); // 오프스크린은 그림자 없이 (룩데브, 반사 프로브 굽기)
     m->frustum = Frustum::fromViewProj(p.viewProj);
 
     const Vec3 sky = p.fogColor;
@@ -666,6 +873,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
 
 void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 count) {
     if (!m || !m->inFrame || count == 0 || meshId >= m->meshes.size()) return;
+    m->ensureScene();
 
     const u64 bytes = static_cast<u64>(count) * sizeof(InstanceData);
     u64 offset = 0;
@@ -738,6 +946,7 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
 
 void Renderer::beginOverlay() {
     if (!m || !m->inFrame) return;
+    m->ensureScene();
     m->device.cmd().beginOverlay();
     m->beginPass(GpuPass::Ui); // UI + 디버그 UI
 }
@@ -762,6 +971,7 @@ void Renderer::updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8
 
 void Renderer::drawUi(const UiQuad* quads, u32 count) {
     if (!m || !m->inFrame) return;
+    m->ensureScene();
     m->flushUploads(); // 복사는 그리기 대상을 푼다: 아래에서 오버레이를 다시 묶는다
     if (count == 0) return;
     const u64 bytes = static_cast<u64>(count) * sizeof(UiQuad);
@@ -799,6 +1009,7 @@ u32 Renderer::height() const { return m ? m->device.height() : 0; }
 
 void Renderer::endFrame() {
     if (!m || !m->inFrame) return;
+    m->ensureScene(); // 아무것도 그리지 않은 프레임도 지운다
     m->endPass();
     if (m->captureOut) {
         rhi::Capture capture;
