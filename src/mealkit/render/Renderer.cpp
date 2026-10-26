@@ -17,7 +17,10 @@
 #include "g_ForwardVS.h"
 #include "g_OutlinePS.h"
 #include "g_OutlineVS.h"
+#include "g_ForwardSkinVS.h"
+#include "g_OutlineSkinVS.h"
 #include "g_ShadowPS.h"
+#include "g_ShadowSkinVS.h"
 #include "g_ShadowVS.h"
 #include "g_SkyPS.h"
 #include "g_SkyVS.h"
@@ -113,7 +116,8 @@ struct ForwardPush {
     u32 instanceOffset = 0;
     u32 debugView = 0;   // render::DebugView (Forward.hlsl PSMain)
     u32 lightOffset = 0; // 인스턴스마다 점광원 번호 8개(8바이트, 0xFF = 끝)의 링 위치 (프레임에 빛이 있을 때만 읽는다)
-    u32 pad[3] = {};
+    u32 paletteOffset = 0; // 스킨 메시: 팔레트(관절마다 48바이트)의 링 위치
+    u32 pad[2] = {};
 };
 
 struct UiPush {
@@ -133,7 +137,17 @@ struct GpuMesh {
     u32 indexCount = 0;
     BoundingSphere bounds;
     bool outline = false; // 외곽선 머티리얼이 하나라도 있다: 외곽선 패스로 한 번 더 그린다
+    bool skinned = false; // 정점 44바이트 (Vertex + SkinWeights), 스킨 파이프라인으로 그린다
 };
+
+// 스킨 파이프라인: 같은 desc에 정점 셰이더(SKINNED=1)와 관절 속성 둘, 정점 간격 44바이트
+rhi::PipelineDesc skinnedDesc(rhi::PipelineDesc d, rhi::ShaderCode vs) {
+    d.vs = vs;
+    d.vertexAttributes.push_back({"JOINTS", rhi::VertexFormat::Uint8x4, sizeof(Vertex)});
+    d.vertexAttributes.push_back({"WEIGHTS", rhi::VertexFormat::Unorm8x4, sizeof(Vertex) + 4});
+    d.vertexStride = kSkinnedVertexStride;
+    return d;
+}
 
 } // namespace
 
@@ -141,6 +155,9 @@ struct Renderer::Impl {
     rhi::Device device;
     rhi::Pipeline forward[kLightingModelCount]; // 조명 모델마다 (init이 모두 만든다: 바꿔도 끊기지 않는다)
     rhi::Pipeline outline;                      // 외곽선 패스 (뒤집은 껍질)
+    // 스킨 메시 변형 (정점 셰이더만 다르다: SKINNED=1). 보기 모드 둘은 디버그 UI 빌드만
+    rhi::Pipeline forwardSkin[kLightingModelCount], outlineSkin, shadowSkin, wireSkin, overdrawSkin;
+    rhi::PipelineDesc forwardSkinDesc[kLightingModelCount], outlineSkinDesc, shadowSkinDesc;
     rhi::Pipeline forwardWire, forwardOverdraw; // 에디터 보기 모드 (디버그 UI 빌드만, PBR 셰이더)
     rhi::Pipeline ui;
     rhi::Pipeline sky; // 스카이박스 (화면 가득 삼각형, 깊이 없이 3D 전에)
@@ -254,12 +271,18 @@ struct Renderer::Impl {
         uploads.erase(uploads.begin(), uploads.begin() + static_cast<std::ptrdiff_t>(done));
     }
 
-    rhi::Pipeline& scenePipeline() {
+    rhi::Pipeline& scenePipeline(bool skinned = false) {
+        if (skinned)
+            return debugView == DebugView::Wireframe ? wireSkin
+                   : debugView == DebugView::Overdraw ? overdrawSkin
+                   : debugView == DebugView::None     ? forwardSkin[static_cast<u32>(lighting)]
+                                                      : forwardSkin[0];
         return debugView == DebugView::Wireframe ? forwardWire
                : debugView == DebugView::Overdraw ? forwardOverdraw
                : debugView == DebugView::None     ? forward[static_cast<u32>(lighting)]
                                                   : forward[0]; // 보기 모드는 조명과 무관한 색 (PBR 셰이더 안)
     }
+    void drawMesh(MeshId meshId, const InstanceData* instances, u32 count, u32 paletteOffset); // drawInstances·drawSkinned
 
     void warnOverflow(u64 bytes) {
         if (uploadOverflowWarned) return;
@@ -363,6 +386,53 @@ bool Renderer::init(const RendererDesc& desc) {
     shadow.cullBack = false; // 양면: 얇은 물체와 열린 모델도 그림자가 빈틈없다 (빛 새는 것은 법선 밀기가 막는다)
     m->shadowDesc = shadow;
     m->shadowPipeline = m->device.createPipeline(shadow);
+    const rhi::ShaderCode skinVS{g_ForwardSkinVS, sizeof(g_ForwardSkinVS)};
+    for (u32 i = 0; i < kLightingModelCount; ++i) {
+        m->forwardSkinDesc[i] = skinnedDesc(m->forwardDesc[i], skinVS);
+        m->forwardSkin[i] = m->device.createPipeline(m->forwardSkinDesc[i]);
+    }
+    m->outlineSkinDesc = skinnedDesc(m->outlineDesc, {g_OutlineSkinVS, sizeof(g_OutlineSkinVS)});
+    m->outlineSkin = m->device.createPipeline(m->outlineSkinDesc);
+    m->shadowSkinDesc = skinnedDesc(m->shadowDesc, {g_ShadowSkinVS, sizeof(g_ShadowSkinVS)});
+    m->shadowSkin = m->device.createPipeline(m->shadowSkinDesc);
+#if MEALKIT_DEBUG_UI
+    m->wireSkin = m->device.createPipeline(skinnedDesc(m->wireDesc(), skinVS));
+    m->overdrawSkin = m->device.createPipeline(skinnedDesc(m->overdrawDesc(), skinVS));
+#endif
+    // 셰이더 핫 리로드: 스킨 변형 (정의 두 개는 한 줄로: "-D"를 사이에 둔다)
+    static const char* const kSkinDefines[kLightingModelCount] = {"LIGHTING_MODEL=0 -D SKINNED=1", "LIGHTING_MODEL=1 -D SKINNED=1",
+                                                                  "LIGHTING_MODEL=2 -D SKINNED=1"};
+    for (u32 i = 0; i < kLightingModelCount; ++i)
+        m->shaderReload.add(
+            "Forward.hlsl",
+            [this, i](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+                rhi::PipelineDesc d = m->forwardSkinDesc[i];
+                d.vs = vs;
+                d.ps = ps;
+                m->forwardSkinDesc[i] = d;
+                return m->device.recreatePipeline(m->forwardSkin[i], d);
+            },
+            "VSMain", "PSMain", kSkinDefines[i]);
+    m->shaderReload.add(
+        "Forward.hlsl",
+        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+            rhi::PipelineDesc d = m->outlineSkinDesc;
+            d.vs = vs;
+            d.ps = ps;
+            m->outlineSkinDesc = d;
+            return m->device.recreatePipeline(m->outlineSkin, d);
+        },
+        "VSOutline", "PSOutline", "SKINNED=1");
+    m->shaderReload.add(
+        "Forward.hlsl",
+        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+            rhi::PipelineDesc d = m->shadowSkinDesc;
+            d.vs = vs;
+            d.ps = ps;
+            m->shadowSkinDesc = d;
+            return m->device.recreatePipeline(m->shadowSkin, d);
+        },
+        "VSShadow", "PSShadow", "SKINNED=1");
     m->shaderReload.add(
         "Forward.hlsl",
         [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
@@ -485,8 +555,18 @@ MeshId Renderer::createMesh(const MeshData& data) {
         return 0;
     }
     GpuMesh mesh;
-    mesh.vertexBuffer =
-        m->device.createBuffer(rhi::BufferUsage::Vertex, data.vertices.data(), data.vertices.size() * sizeof(Vertex));
+    mesh.skinned = data.skin.size() == data.vertices.size();
+    if (mesh.skinned) { // Vertex 뒤에 SkinWeights를 붙인 44바이트 정점
+        std::vector<u8> interleaved(data.vertices.size() * kSkinnedVertexStride);
+        for (size_t i = 0; i < data.vertices.size(); ++i) {
+            std::memcpy(&interleaved[i * kSkinnedVertexStride], &data.vertices[i], sizeof(Vertex));
+            std::memcpy(&interleaved[i * kSkinnedVertexStride + sizeof(Vertex)], &data.skin[i], sizeof(SkinWeights));
+        }
+        mesh.vertexBuffer = m->device.createBuffer(rhi::BufferUsage::Vertex, interleaved.data(), interleaved.size());
+    } else {
+        mesh.vertexBuffer =
+            m->device.createBuffer(rhi::BufferUsage::Vertex, data.vertices.data(), data.vertices.size() * sizeof(Vertex));
+    }
     // 정점이 적으면 16비트 인덱스로 줄여 메모리 대역폭을 아낀다 (내장 그래픽에서 중요)
     if (data.vertices.size() <= 0xFFFF) {
         const std::vector<u16> shortIndices(data.indices.begin(), data.indices.end());
@@ -687,6 +767,7 @@ void Renderer::drawShadows(const DrawList& list) {
             }
             std::memcpy(cpu, visible.data(), bytes);
             const GpuMesh& gm = m->meshes[mesh];
+            if (gm.skinned) continue; // 스킨 메시는 아래에서 팔레트와 함께
             const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(offset), 0, 0};
             cmd.pushConstants(&push, sizeof(push));
             cmd.setVertexBuffer(gm.vertexBuffer, sizeof(Vertex));
@@ -694,6 +775,36 @@ void Renderer::drawShadows(const DrawList& list) {
             cmd.drawIndexed(gm.indexCount, static_cast<u32>(visible.size()));
             m->stats.drawCalls += 1;
         }
+        // 스킨 메시: 캐릭터마다 팔레트를 올리고 하나씩
+        bool skinBound = false;
+        for (const DrawList::SkinnedItem& item : list.skinned()) {
+            if (item.mesh >= m->meshes.size() || !m->meshes[item.mesh].skinned) continue;
+            const GpuMesh& gm = m->meshes[item.mesh];
+            const InstanceData& inst = item.instance;
+            const Vec3 s = inst.scale;
+            const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)}) * DrawList::kSkinnedBoundsScale;
+            const Vec3 center = inst.position + rotate(inst.rotation, Vec3{gm.bounds.center.x * s.x, gm.bounds.center.y * s.y, gm.bounds.center.z * s.z});
+            if (!frustum.sphereVisible(center, gm.bounds.radius * scale)) continue;
+            const u64 paletteBytes = static_cast<u64>(std::min(item.boneCount, 64u)) * sizeof(BoneMatrix);
+            u64 paletteOffset = 0, instanceOffset = 0;
+            u8* palette = m->device.allocUpload(paletteBytes, kRingAlignment, &paletteOffset);
+            u8* instance = palette ? m->device.allocUpload(sizeof(InstanceData), kRingAlignment, &instanceOffset) : nullptr;
+            if (!instance) {
+                m->warnOverflow(paletteBytes);
+                continue;
+            }
+            std::memcpy(palette, list.bones(item), paletteBytes);
+            std::memcpy(instance, &inst, sizeof(InstanceData));
+            if (!skinBound) cmd.setPipeline(m->shadowSkin), skinBound = true;
+            ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(instanceOffset), 0, 0};
+            push.paletteOffset = static_cast<u32>(paletteOffset);
+            cmd.pushConstants(&push, sizeof(push));
+            cmd.setVertexBuffer(gm.vertexBuffer, kSkinnedVertexStride);
+            cmd.setIndexBuffer(gm.indexBuffer);
+            cmd.drawIndexed(gm.indexCount, 1);
+            m->stats.drawCalls += 1;
+        }
+        if (skinBound) cmd.setPipeline(m->shadowPipeline);
     }
     cmd.endTarget(m->shadowTarget);
 }
@@ -874,20 +985,45 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
 void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 count) {
     if (!m || !m->inFrame || count == 0 || meshId >= m->meshes.size()) return;
     m->ensureScene();
+    if (m->meshes[meshId].skinned) { // 팔레트 없이 add한 스킨 메시: 바인드 자세 (단위 팔레트)
+        static const std::vector<BoneMatrix> identity(64, BoneMatrix{{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}});
+        for (u32 i = 0; i < count; ++i) drawSkinned(meshId, instances[i], identity.data(), 64);
+        return;
+    }
+    m->drawMesh(meshId, instances, count, 0);
+}
 
-    const u64 bytes = static_cast<u64>(count) * sizeof(InstanceData);
-    u64 offset = 0;
-    u8* cpu = m->device.allocUpload(bytes, kRingAlignment, &offset);
+bool Renderer::meshSkinned(MeshId mesh) const { return m && mesh < m->meshes.size() && m->meshes[mesh].skinned; }
+
+void Renderer::drawSkinned(MeshId meshId, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount) {
+    if (!m || !m->inFrame || meshId >= m->meshes.size() || !bones || boneCount == 0) return;
+    m->ensureScene();
+    u64 paletteOffset = 0;
+    const u64 bytes = static_cast<u64>(std::min(boneCount, 64u)) * sizeof(BoneMatrix);
+    u8* cpu = m->device.allocUpload(bytes, kRingAlignment, &paletteOffset);
     if (!cpu) {
         m->warnOverflow(bytes);
         return;
     }
+    std::memcpy(cpu, bones, bytes);
+    m->drawMesh(meshId, &instance, 1, static_cast<u32>(paletteOffset));
+}
+
+void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 count, u32 paletteOffset) {
+    const u64 bytes = static_cast<u64>(count) * sizeof(InstanceData);
+    u64 offset = 0;
+    u8* cpu = device.allocUpload(bytes, kRingAlignment, &offset);
+    if (!cpu) {
+        warnOverflow(bytes);
+        return;
+    }
     std::memcpy(cpu, instances, bytes);
 
-    const GpuMesh& mesh = m->meshes[meshId];
+    const GpuMesh& mesh = meshes[meshId];
+    const f32 boundsScale = mesh.skinned ? DrawList::kSkinnedBoundsScale : 1.0f; // 빛 고르기 (애니메이션 여유)
     u64 lightOffset = 0;
-    if (!m->frameLights.empty()) { // 점광원: 인스턴스마다 영향이 큰 빛을 고른다 (바운딩 구와 닿는 빛, 중심에서의 밝기 순)
-        m->lightPicks.assign(static_cast<size_t>(count) * kMaxLightsPerObject, 0xFF);
+    if (!frameLights.empty()) { // 점광원: 인스턴스마다 영향이 큰 빛을 고른다 (바운딩 구와 닿는 빛, 중심에서의 밝기 순)
+        lightPicks.assign(static_cast<size_t>(count) * kMaxLightsPerObject, 0xFF);
         struct Pick {
             f32 score;
             u32 light;
@@ -896,19 +1032,19 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
         for (u32 i = 0; i < count; ++i) {
             const InstanceData& inst = instances[i];
             const Vec3 s = inst.scale;
-            const f32 radius = mesh.bounds.radius * std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+            const f32 radius = mesh.bounds.radius * boundsScale * std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
             const Vec3 center =
                 inst.position + rotate(inst.rotation, Vec3{mesh.bounds.center.x * s.x, mesh.bounds.center.y * s.y, mesh.bounds.center.z * s.z});
             u32 picked = 0;
-            for (u32 l = 0; l < m->frameLights.size(); ++l) {
-                const PointLight& light = m->frameLights[l];
+            for (u32 l = 0; l < frameLights.size(); ++l) {
+                const PointLight& light = frameLights[l];
                 const Vec3 d = light.position - center;
                 const f32 dist = std::sqrt(dot(d, d));
                 if (dist > light.range + radius) continue;
                 const f32 near = std::max(dist - radius, 0.0f); // 물체에서 가장 가까운 점
                 const f32 score = (light.color.x + light.color.y + light.color.z) * (1.0f - near / light.range) / (near * near + 1.0f);
-                u32 at = picked < m->lightsPerObject ? picked++ : m->lightsPerObject;
-                if (at == m->lightsPerObject) { // 가득 찼다: 가장 약한 것보다 세면 바꾼다
+                u32 at = picked < lightsPerObject ? picked++ : lightsPerObject;
+                if (at == lightsPerObject) { // 가득 찼다: 가장 약한 것보다 세면 바꾼다
                     u32 weakest = 0;
                     for (u32 k = 1; k < picked; ++k)
                         if (best[k].score < best[weakest].score) weakest = k;
@@ -917,30 +1053,34 @@ void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 c
                 }
                 best[at] = {score, l};
             }
-            for (u32 k = 0; k < picked; ++k) m->lightPicks[static_cast<size_t>(i) * kMaxLightsPerObject + k] = static_cast<u8>(best[k].light);
+            for (u32 k = 0; k < picked; ++k) lightPicks[static_cast<size_t>(i) * kMaxLightsPerObject + k] = static_cast<u8>(best[k].light);
         }
-        if (u8* dst = m->device.allocUpload(m->lightPicks.size(), kRingAlignment, &lightOffset)) {
-            std::memcpy(dst, m->lightPicks.data(), m->lightPicks.size());
+        if (u8* dst = device.allocUpload(lightPicks.size(), kRingAlignment, &lightOffset)) {
+            std::memcpy(dst, lightPicks.data(), lightPicks.size());
         } else {
-            m->warnOverflow(m->lightPicks.size());
+            warnOverflow(lightPicks.size());
             return;
         }
     }
-    rhi::CommandList& cmd = m->device.cmd();
-    const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset),
-                           static_cast<u32>(m->debugView), static_cast<u32>(lightOffset)};
+    rhi::CommandList& cmd = device.cmd();
+    ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), static_cast<u32>(offset),
+                     static_cast<u32>(debugView), static_cast<u32>(lightOffset)};
+    push.paletteOffset = paletteOffset;
+    if (mesh.skinned) cmd.setPipeline(scenePipeline(true));
     cmd.pushConstants(&push, sizeof(push));
-    cmd.setVertexBuffer(mesh.vertexBuffer, sizeof(Vertex));
+    cmd.setVertexBuffer(mesh.vertexBuffer, mesh.skinned ? kSkinnedVertexStride : sizeof(Vertex));
     cmd.setIndexBuffer(mesh.indexBuffer);
     cmd.drawIndexed(mesh.indexCount, count);
-    m->stats.drawCalls += 1;
-    m->stats.instances += count;
-    if (mesh.outline && m->debugView == DebugView::None) { // 외곽선: 같은 인스턴스를 껍질 패스로 한 번 더
-        cmd.setPipeline(m->outline);
+    stats.drawCalls += 1;
+    stats.instances += count;
+    if (mesh.outline && debugView == DebugView::None) { // 외곽선: 같은 인스턴스를 껍질 패스로 한 번 더
+        cmd.setPipeline(mesh.skinned ? outlineSkin : outline);
         cmd.pushConstants(&push, sizeof(push));
         cmd.drawIndexed(mesh.indexCount, count);
-        cmd.setPipeline(m->scenePipeline());
-        m->stats.drawCalls += 1;
+        cmd.setPipeline(scenePipeline());
+        stats.drawCalls += 1;
+    } else if (mesh.skinned) {
+        cmd.setPipeline(scenePipeline());
     }
 }
 

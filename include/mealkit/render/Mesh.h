@@ -20,9 +20,24 @@ static_assert(sizeof(Vertex) == 36);
 // float 두 개 → half 두 개 (반올림, 범위 밖은 무한대)
 u32 packHalf2(f32 u, f32 v);
 
+// 스킨 정점의 관절 4개 (스켈레탈 애니메이션): 번호 u8 ×4, 가중치 unorm8 ×4 (합 255). GPU에는 Vertex 뒤에 붙어 44바이트
+struct SkinWeights {
+    u32 joints = 0;
+    u32 weights = 0xFFu; // 첫 관절 1
+};
+static_assert(sizeof(SkinWeights) == 8);
+inline constexpr u32 kSkinnedVertexStride = sizeof(Vertex) + sizeof(SkinWeights);
+
+// 스킨 팔레트 한 칸 (HLSL 정점 셰이더가 읽는 48바이트: 행 셋, p' = (dot(r0, p1), dot(r1, p1), dot(r2, p1))). asset::skinPalette가 채운다
+struct BoneMatrix {
+    f32 rows[3][4];
+};
+static_assert(sizeof(BoneMatrix) == 48);
+
 struct MeshData {
     std::vector<Vertex> vertices;
     std::vector<u32> indices; // 정점이 65536개 미만이면 GPU에는 16비트로 올라간다
+    std::vector<SkinWeights> skin; // 비었으면 정적 메시, 있으면 정점마다 하나 (스킨 메시)
 };
 
 // 원점 중심, 한 변 1인 상자. 면마다 정점을 따로 둬서 법선이 각지게 나온다.

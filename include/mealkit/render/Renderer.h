@@ -270,6 +270,9 @@ public:
     bool beginFrame(const FrameParams& params);
     // 같은 메시의 인스턴스를 드로우 콜 1회로 그린다.
     void drawInstances(MeshId mesh, const InstanceData* instances, u32 count);
+    // 스킨 메시 하나 (캐릭터마다 드로우 콜 1회): bones는 asset::skinPalette의 팔레트 (관절 수, 최대 64)
+    void drawSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount);
+    bool meshSkinned(MeshId mesh) const;
     // 오프스크린 그림 (에디터 룩데브 창): 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
     rhi::RenderTarget createRenderTarget(u32 width, u32 height);
     rhi::Texture renderTargetTexture(rhi::RenderTarget target) const; // ImGui::Image (rhi::imguiTextureId)
