@@ -17,6 +17,8 @@
 #include "g_ForwardVS.h"
 #include "g_OutlinePS.h"
 #include "g_OutlineVS.h"
+#include "g_SkyPS.h"
+#include "g_SkyVS.h"
 #include "g_UiPS.h"
 #include "g_UiVS.h"
 
@@ -36,8 +38,39 @@ struct FrameConstants {
     u32 materials[4]; // 머티리얼 표의 링 위치, 개수, 0, 0
     f32 wind[4];      // 수평 방향 x, z, 세기, 화면 시간
     u32 style[4];     // 툰 램프 텍스처 (bindless), 0, 0, 0
+    f32 invViewProj[16]; // 스카이박스: 화면 → 월드 방향
+    u32 env[4];          // 하늘 큐브, 반사 큐브 (g_cubes 번호), 반사 밉 수, 있음(1)
+    f32 envParams[4];    // 세기, cos(회전), sin(회전), 0
+    f32 sh[9][4];        // 환경광 SH (rgb, 0)
 };
-static_assert(sizeof(FrameConstants) == 224);
+static_assert(sizeof(FrameConstants) == 464);
+
+// 4×4 역행렬 (행 우선, 행 벡터 규칙 그대로). 특이 행렬이면 단위 행렬
+void invert(const f32 m[16], f32 out[16]) {
+    f32 inv[16];
+    inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+    inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+    inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+    inv[1] = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+    inv[5] = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+    inv[9] = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+    inv[2] = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+    inv[6] = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+    inv[3] = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+    inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+    const f32 det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (std::abs(det) < 1e-30f) {
+        for (int i = 0; i < 16; ++i) out[i] = (i % 5 == 0) ? 1.0f : 0.0f;
+        return;
+    }
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
+}
 
 // shaders/Forward.hlsl Material (128바이트)
 struct MaterialGpu {
@@ -100,6 +133,14 @@ struct Renderer::Impl {
     rhi::Pipeline outline;                      // 외곽선 패스 (뒤집은 껍질)
     rhi::Pipeline forwardWire, forwardOverdraw; // 에디터 보기 모드 (디버그 UI 빌드만, PBR 셰이더)
     rhi::Pipeline ui;
+    rhi::Pipeline sky; // 스카이박스 (화면 가득 삼각형, 깊이 없이 3D 전에)
+    rhi::PipelineDesc skyDesc;
+    struct Environment {
+        u32 sky = 0, reflect = 0, reflectMips = 0; // g_cubes 번호
+        f32 sh[9][3] = {};
+    };
+    std::vector<Environment> environments; // createEnvironment 번호 - 1
+    void drawSky(const FrameParams& p); // 프레임 상수를 쓴 뒤, 3D 전에 (환경이 없으면 아무것도 하지 않는다)
     LightingModel lighting = LightingModel::Pbr;
     DebugView debugView = DebugView::None;
     // 셰이더 핫 리로드가 바이트코드만 바꿔 다시 만든다. forwardDesc[n]의 VS는 모두 같다
@@ -260,6 +301,24 @@ bool Renderer::init(const RendererDesc& desc) {
             return m->device.recreatePipeline(m->outline, d);
         },
         "VSOutline", "PSOutline");
+    rhi::PipelineDesc sky;
+    sky.vs = {g_SkyVS, sizeof(g_SkyVS)};
+    sky.ps = {g_SkyPS, sizeof(g_SkyPS)};
+    sky.target = rhi::Target::Scene;
+    sky.cullBack = false;
+    sky.depthTest = false; // 먼저 그리고 3D가 덮는다 (깊이도 쓰지 않는다)
+    m->skyDesc = sky;
+    m->sky = m->device.createPipeline(sky);
+    m->shaderReload.add(
+        "Forward.hlsl",
+        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+            rhi::PipelineDesc d = m->skyDesc;
+            d.vs = vs;
+            d.ps = ps;
+            m->skyDesc = d;
+            return m->device.recreatePipeline(m->sky, d);
+        },
+        "VSSky", "PSSky");
     m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
         rhi::PipelineDesc d = m->uiDesc;
         d.vs = vs;
@@ -401,13 +460,14 @@ bool Renderer::beginFrame(const FrameParams& p) {
         vh = std::min(p.viewport.height, fullH - vy);
     }
     cmd.setViewport(vx, vy, vw, vh);
-    cmd.setPipeline(m->scenePipeline());
 
     m->materialOffset = 0;
     const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
     if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &m->materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
     else m->warnOverflow(materialBytes);
     m->writeFrameConstants(p, &m->frameOffset);
+    if (!overdraw) m->drawSky(p);
+    cmd.setPipeline(m->scenePipeline());
 
     m->stats = {};
     m->frustum = Frustum::fromViewProj(p.viewProj);
@@ -443,10 +503,51 @@ void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset) {
     const f32 windValues[4] = {wind.x, wind.z, std::max(p.windStrength, 0.0f), p.time};
     std::memcpy(fc.wind, windValues, sizeof(windValues));
     fc.style[0] = device.textureIndex(toonRamp);
+    invert(&p.viewProj.m[0][0], fc.invViewProj);
+    if (p.environment && p.environment <= environments.size()) {
+        const Environment& e = environments[p.environment - 1];
+        const u32 env[4] = {e.sky, e.reflect, e.reflectMips, 1u};
+        std::memcpy(fc.env, env, sizeof(env));
+        const f32 params[4] = {std::max(p.environmentIntensity, 0.0f), std::cos(p.environmentRotation), std::sin(p.environmentRotation), 0.0f};
+        std::memcpy(fc.envParams, params, sizeof(params));
+        for (u32 i = 0; i < 9; ++i) std::memcpy(fc.sh[i], e.sh[i], sizeof(e.sh[i]));
+    }
     fc.materials[0] = static_cast<u32>(materialOffset);
     fc.materials[1] = static_cast<u32>(materials.size());
     if (u8* cpu = device.allocUpload(sizeof(fc), kRingAlignment, offset)) std::memcpy(cpu, &fc, sizeof(fc));
     else warnOverflow(sizeof(fc));
+}
+
+void Renderer::Impl::drawSky(const FrameParams& p) {
+    if (!p.environment || p.environment > environments.size()) return;
+    rhi::CommandList& cmd = device.cmd();
+    cmd.setPipeline(sky);
+    const ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), 0, 0};
+    cmd.pushConstants(&push, sizeof(push));
+    cmd.draw(3, 1);
+    stats.drawCalls += 1;
+}
+
+u32 Renderer::createEnvironment(const EnvironmentData& d) {
+    if (!m || !d.sky || !d.reflect || !d.skySize || !d.reflectSize || !d.reflectMips) return 0;
+    Impl::Environment e;
+    rhi::TextureInit sky;
+    sky.width = sky.height = d.skySize;
+    sky.format = rhi::Format::Rgb9e5;
+    sky.data = d.sky;
+    sky.cube = true;
+    rhi::TextureInit reflect;
+    reflect.width = reflect.height = d.reflectSize;
+    reflect.mipLevels = d.reflectMips;
+    reflect.format = rhi::Format::Rgb9e5;
+    reflect.data = d.reflect;
+    reflect.cube = true;
+    e.sky = createTexture(sky);
+    e.reflect = createTexture(reflect);
+    e.reflectMips = d.reflectMips;
+    std::memcpy(e.sh, d.sh, sizeof(e.sh));
+    m->environments.push_back(e);
+    return static_cast<u32>(m->environments.size());
 }
 
 rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {
@@ -479,6 +580,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     cmd.beginTarget(target, clear, 0.0f);
     const auto [w, h] = m->targetSizes[target.id];
     cmd.setViewport(0.0f, 0.0f, static_cast<f32>(w), static_cast<f32>(h));
+    m->drawSky(p);
     cmd.setPipeline(m->scenePipeline());
     list.submit(*this);
     cmd.endTarget(target);

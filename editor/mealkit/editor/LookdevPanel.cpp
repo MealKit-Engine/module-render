@@ -14,7 +14,7 @@ constexpr u32 kTargetSize = 768; // 정사각형 그림 (창 크기에 맞춰 �
 constexpr f32 kFovY = 35.0f * 3.14159265f / 180.0f;
 constexpr f32 kSpinSpeed = 0.5f; // 받침대가 도는 속도 (rad/s)
 
-// 조명 프리셋: HDRI 항목(하늘 HDRI와 환경광) 전까지 태양·하늘·땅·배경 색 묶음. 그 항목에서 HDRI를 같은 목록에 더한다
+// 색 조명 프리셋: 태양·하늘·땅·배경 색 묶음. 목록에서 이 뒤에 assets/textures의 .hdr의 하늘 HDRI가 온다 (태양은 중립 스튜디오 것)
 struct LightPreset {
     Vec3 sunDirection, sunColor, sky, ground, background;
 };
@@ -45,7 +45,12 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
 
     const asset::Model* model = m_model.empty() ? nullptr : models.get(m_model);
     m_hasModel = model != nullptr;
-    const LightPreset& light = kPresets[std::min(m_preset, kPresetCount - 1)];
+    if (!m_hdrisListed) {
+        m_hdris = asset::listHdris(asset::ModelCache::assetsRoot());
+        m_hdrisListed = true;
+    }
+    const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
+    const LightPreset& light = kPresets[hdri ? 0 : std::min(m_preset, kPresetCount - 1)];
 
     // 모델 경계 상자에 맞춰 카메라 거리를 정한다 (받침대 위 가운데)
     Vec3 lo{-0.5f, 0.0f, -0.5f}, hi{0.5f, 1.0f, 0.5f};
@@ -66,6 +71,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
     frame.groundColor = light.ground;
     frame.fogColor = light.background;
     frame.fogDensity = 0.0f;
+    if (hdri) frame.environment = models.environment(m_hdris[m_preset - kPresetCount]);
     frame.time = static_cast<f32>(std::fmod(ImGui::GetTime(), 4096.0)); // 바람 흔들림
 
     m_drawList.clear();
@@ -90,9 +96,14 @@ void LookdevPanel::draw(render::Renderer& renderer, bool* open) {
         ImGui::End();
         return;
     }
-    if (ImGui::BeginCombo(tr("Light"), presetName(m_preset))) {
+    const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
+    if (ImGui::BeginCombo(tr("Light"), hdri ? m_hdris[m_preset - kPresetCount].c_str() : presetName(m_preset))) {
+        if (ImGui::IsWindowAppearing()) m_hdris = asset::listHdris(asset::ModelCache::assetsRoot()); // 새로 넣은 HDRI
         for (u32 i = 0; i < kPresetCount; ++i)
             if (ImGui::Selectable(presetName(i), m_preset == i)) m_preset = i;
+        if (!m_hdris.empty()) ImGui::Separator();
+        for (u32 i = 0; i < m_hdris.size(); ++i)
+            if (ImGui::Selectable(m_hdris[i].c_str(), m_preset == kPresetCount + i)) m_preset = kPresetCount + i;
         ImGui::EndCombo();
     }
     const char* lightingNames[] = {tr("Project setting"), "Pbr", "Toon", "Unlit"};

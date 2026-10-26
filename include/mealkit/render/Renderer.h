@@ -118,6 +118,20 @@ struct FrameParams {
     f32 time = 0.0f;
     Vec3 windDirection{1.0f, 0.0f, 0.3f}; // 수평 방향 (정규화는 렌더러가 한다)
     f32 windStrength = 1.0f;              // 머티리얼 windStrength에 곱한다 (0 = 바람 없음)
+    // 하늘 HDRI (Renderer::createEnvironment 번호, 0 = 없음: 하늘·땅 색 그라디언트와 안개 색 배경). 있으면 스카이박스를 그리고
+    // 환경광(SH)·반사(큐브 밉 = 거칠기)를 그 HDRI에서 읽는다. 세기는 하늘·환경광·반사 모두에 곱하고, 회전은 y축 (라디안)
+    u32 environment = 0;
+    f32 environmentIntensity = 1.0f;
+    f32 environmentRotation = 0.0f;
+};
+
+// 하늘 HDRI에서 구운 환경 (asset::EnvironmentMap, 큐브는 RGB9E5, 면 +X −X +Y −Y +Z −Z 차례로). createEnvironment가 GPU에 올린다
+struct EnvironmentData {
+    f32 sh[9][3] = {}; // 환경광 색 = Σ sh[i] · Y_i(n)
+    u32 skySize = 0;
+    const u32* sky = nullptr; // 면마다 skySize²
+    u32 reflectSize = 0, reflectMips = 0;
+    const u32* reflect = nullptr; // 면마다 밉 0부터
 };
 
 struct RendererDesc {
@@ -198,6 +212,8 @@ public:
     const Frustum& frustum() const;
     void addCulled(u32 count); // 통계용 (DrawList::submit)
 
+    // 하늘 HDRI 환경을 GPU에 올리고 번호를 준다 (FrameParams::environment). 지우지 않는다: 같은 HDRI는 쓰는 쪽(ModelCache)이 번호를 다시 쓴다
+    u32 createEnvironment(const EnvironmentData& data);
     // 조명 모델 (프로젝트 설정, game::applyRenderStyle). 파이프라인은 init이 모두 만들어 두어 바로 바뀐다
     void setLightingModel(LightingModel model);
     LightingModel lightingModel() const;
