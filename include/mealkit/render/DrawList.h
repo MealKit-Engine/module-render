@@ -17,7 +17,12 @@ public:
         for (auto& bucket : m_buckets) bucket.clear();
         m_skinned.clear();
         m_bones.clear();
+        m_particles.clear();
     }
+
+    // 파티클 (feedback::Player::addParticles): 불투명 3D 다음 한 번에 그린다
+    void addParticles(const Particle* particles, size_t count) { m_particles.insert(m_particles.end(), particles, particles + count); }
+    const std::vector<Particle>& particles() const { return m_particles; }
 
     // 스킨 메시 (캐릭터): 팔레트를 복사해 둔다 (asset::skinPalette). 메시마다 묶지 않고 하나씩 그린다
     void addSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount) {
@@ -68,6 +73,7 @@ public:
             else
                 renderer.addCulled(1);
         }
+        if (!m_particles.empty()) renderer.drawParticles(m_particles.data(), static_cast<u32>(m_particles.size()));
     }
 
     // 메시 번호 = 칸 번호 (그림자 패스가 읽는다)
@@ -77,6 +83,7 @@ private:
     std::vector<std::vector<InstanceData>> m_buckets;
     std::vector<SkinnedItem> m_skinned;
     std::vector<BoneMatrix> m_bones;
+    std::vector<Particle> m_particles;
     mutable std::vector<InstanceData> m_visible; // submit의 작업 버퍼 (프레임 사이에 재사용)
 };
 

@@ -24,6 +24,8 @@
 #include "g_ShadowVS.h"
 #include "g_SkyPS.h"
 #include "g_SkyVS.h"
+#include "g_ParticlePS.h"
+#include "g_ParticleVS.h"
 #include "g_UiPS.h"
 #include "g_UiVS.h"
 
@@ -160,6 +162,8 @@ struct Renderer::Impl {
     rhi::PipelineDesc forwardSkinDesc[kLightingModelCount], outlineSkinDesc, shadowSkinDesc;
     rhi::Pipeline forwardWire, forwardOverdraw; // 에디터 보기 모드 (디버그 UI 빌드만, PBR 셰이더)
     rhi::Pipeline ui;
+    rhi::Pipeline particles; // shaders/Particle.hlsl (불투명 3D 다음, 깊이 쓰기 없음)
+    rhi::PipelineDesc particleDesc;
     rhi::Pipeline sky; // 스카이박스 (화면 가득 삼각형, 깊이 없이 3D 전에)
     rhi::PipelineDesc skyDesc;
     struct Environment {
@@ -443,6 +447,21 @@ bool Renderer::init(const RendererDesc& desc) {
             return m->device.recreatePipeline(m->shadowPipeline, d);
         },
         "VSShadow", "PSShadow");
+    rhi::PipelineDesc particles;
+    particles.vs = {g_ParticleVS, sizeof(g_ParticleVS)};
+    particles.ps = {g_ParticlePS, sizeof(g_ParticlePS)};
+    particles.target = rhi::Target::Scene;
+    particles.cullBack = false;
+    particles.premultipliedBlend = true; // 더하기 파티클은 알파 0으로 낸다
+    particles.depthWrite = false;
+    m->particleDesc = particles;
+    m->particles = m->device.createPipeline(particles);
+    m->shaderReload.add("Particle.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+        rhi::PipelineDesc d = m->particleDesc;
+        d.vs = vs;
+        d.ps = ps;
+        return m->device.recreatePipeline(m->particles, d);
+    });
     m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
         rhi::PipelineDesc d = m->uiDesc;
         d.vs = vs;
@@ -1082,6 +1101,29 @@ void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 
     } else if (mesh.skinned) {
         cmd.setPipeline(scenePipeline());
     }
+}
+
+void Renderer::drawParticles(const Particle* particles, u32 count) {
+    if (!m || !m->inFrame || !particles || count == 0) return;
+    m->ensureScene();
+    count = std::min(count, kMaxParticlesPerFrame);
+    const u64 bytes = static_cast<u64>(count) * sizeof(Particle);
+    u64 offset = 0;
+    u8* cpu = m->device.allocUpload(bytes, kRingAlignment, &offset);
+    if (!cpu) {
+        m->warnOverflow(bytes);
+        return;
+    }
+    std::memcpy(cpu, particles, bytes);
+    rhi::CommandList& cmd = m->device.cmd();
+    const bool vfxPass = m->openPass == static_cast<i32>(GpuPass::Opaque); // 오프스크린(룩데브)은 따로 재지 않는다
+    if (vfxPass) m->beginPass(GpuPass::Vfx);
+    cmd.setPipeline(m->particles);
+    const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset), 0, 0};
+    cmd.pushConstants(&push, sizeof(push));
+    cmd.draw(6, count);
+    cmd.setPipeline(m->scenePipeline()); // 뒤에 더 그리는 3D가 있으면 (drawToTarget 등)
+    m->stats.drawCalls += 1; // Vfx 구간은 beginOverlay(UI)까지 (파티클은 DrawList::submit의 마지막)
 }
 
 void Renderer::beginOverlay() {

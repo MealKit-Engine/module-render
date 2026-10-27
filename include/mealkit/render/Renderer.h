@@ -95,6 +95,20 @@ constexpr u32 rgba(u8 r, u8 g, u8 b, u8 a = 255) {
     return static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) | (static_cast<u32>(a) << 24);
 }
 
+// 파티클 하나 (HLSL Particle과 같은 32바이트, shaders/Particle.hlsl). 카메라를 보는 둥근 쿼드, 불투명 3D 다음에
+// 깊이 시험만 하고(쓰지 않음) 미리 곱한 알파로 섞는다. 더하기 섞기 파티클은 알파 0으로 낸다 (파이프라인 하나)
+struct Particle {
+    Vec3 position;
+    f32 size = 0.1f;   // 지름 (미터)
+    u32 color = 0xFFFFFFFF; // sRGB RGBA8 (rgba()), 곧은 알파
+    f32 rotation = 0.0f; // 라디안 (화면 안에서)
+    u32 flags = 0;       // kParticleAdditive
+    f32 softness = 0.5f; // 가장자리 흐림 0 (딱딱한 원) .. 1 (가운데부터 흐려진다)
+};
+static_assert(sizeof(Particle) == 32, "Particle must match the HLSL layout");
+inline constexpr u32 kParticleAdditive = 1u;
+inline constexpr u32 kMaxParticlesPerFrame = 16384; // 넘으면 앞에서부터 (업로드 링 512 KB)
+
 // 3D를 그릴 화면 영역(픽셀). width가 0이면 창 전체.
 struct Viewport {
     f32 x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
@@ -273,6 +287,8 @@ public:
     // 스킨 메시 하나 (캐릭터마다 드로우 콜 1회): bones는 asset::skinPalette의 팔레트 (관절 수, 최대 64)
     void drawSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount);
     bool meshSkinned(MeshId mesh) const;
+    // 파티클 (DrawList::submit이 불투명 3D 다음에 부른다): 드로우 콜 1회, GPU 패스 Vfx
+    void drawParticles(const Particle* particles, u32 count);
     // 오프스크린 그림 (에디터 룩데브 창): 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
     rhi::RenderTarget createRenderTarget(u32 width, u32 height);
     rhi::Texture renderTargetTexture(rhi::RenderTarget target) const; // ImGui::Image (rhi::imguiTextureId)
