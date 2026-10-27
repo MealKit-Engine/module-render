@@ -92,7 +92,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
 
 void LookdevPanel::draw(render::Renderer& renderer, bool* open) {
     ImGui::SetNextWindowSize(ImVec2(420, 520), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(tr("Look Dev###LookDev"), open)) {
+    if (!ImGui::Begin(trl(kWindow), open)) {
         ImGui::End();
         return;
     }

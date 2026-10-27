@@ -14,6 +14,7 @@ namespace mealkit::editor {
 
 class LookdevPanel {
 public:
+    static constexpr const char* kWindow = "Look Dev###LookDev";
     // 보여 줄 모델 (씬에서 고른 물체의 모델, 비면 안내만)
     void setModel(const std::string& path) { m_model = path; }
     const std::string& model() const { return m_model; }
