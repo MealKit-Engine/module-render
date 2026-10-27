@@ -149,14 +149,14 @@ struct PostPush {
 // shaders/Post.hlsl PostConstants (업로드 링, 96바이트)
 struct PostConstants {
     f32 exposure[4]; // 노출 배율, 블룸 세기, 비네트 세기, 비네트 부드러움
-    f32 effects[4];  // 그레인, 색수차, 시간, 0
+    f32 effects[4];  // 그레인, 색수차, 시간, 샤프닝
     u32 textures[4]; // 블룸 사슬 맨 위, LUT, 플래그, 0 (없음 = kNoTexture)
     f32 bloom[4];    // 블룸 색, 문턱
     f32 region[4];   // 장면 영역 uv
     f32 sceneSize[4];
 };
 static_assert(sizeof(PostConstants) == 96);
-constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u; // Post.hlsl kPost*
+constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u, kPostSharpen = 8u; // Post.hlsl kPost*
 constexpr u32 kLutWidth = kLutSize * kLutSize; // 32³을 가로 띠 1024 × 32로 (파랑 조각마다 32칸)
 
 // 색맹 보정 (Fidaner 계열 daltonize): 선형 RGB에서 Machado 2009(심한 정도 1.0)로 그 사람이 보는 색을 흉내 내고,
@@ -263,7 +263,16 @@ struct Renderer::Impl {
     void resizeChain(PostChain& chain, u32 width, u32 height); // 프레임 밖에서 (옛 대상은 지운다)
     void ensureBloom(PostChain& chain);
     // 장면 대상(chain.scene, endTarget까지 끝난)을 output(없으면 백버퍼의 rect 영역)으로. timed: GPU 패스 Post로 잰다
-    void runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed, f32 time);
+    // scale: 장면은 rect × scale 영역에 있다 (동적 해상도, 우버 패스가 rect로 늘린다)
+    void runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed, f32 time,
+                 f32 scale = 1.0f);
+    // 동적 해상도 (본 화면만): beginFrame이 GPU 시간으로 배율을 고른다
+    ResolutionSettings resolution;
+    f32 renderScale = 1.0f;  // 조절기가 고른 배율
+    f32 sceneScale = 1.0f;   // 이번 프레임 (보기 모드는 1)
+    f32 gpuAverage = 0.0f;   // GPU 프레임 시간 지수 평균
+    u32 scaleCooldown = 0;   // 배율을 바꾼 뒤 기다릴 프레임 (GPU 시간은 kFramesInFlight 늦다)
+    void updateResolution();
     bool sceneResolved = false; // 본 화면을 포스트로 백버퍼에 냈다 (이 뒤로 본 화면 3D 없음)
     void resolveScene();        // ensureScene 다음에
 
@@ -752,6 +761,8 @@ bool Renderer::beginFrame(const FrameParams& p) {
     const f32 viewport[4] = {vx, vy, vw, vh};
     std::memcpy(m->sceneViewport, viewport, sizeof(viewport));
     (void)cmd;
+    m->updateResolution();
+    m->sceneScale = m->debugView == DebugView::None ? m->renderScale : 1.0f;
 
     m->materialOffset = 0;
     const u64 materialBytes = m->materials.size() * sizeof(MaterialGpu);
@@ -786,6 +797,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     m->stats.gpuValid = gpu.valid;
     m->stats.gpuFrameMs = gpu.frameMs;
     for (u32 i = 0; i < kGpuPassCount; ++i) m->stats.gpuPassMs[i] = gpu.timerMs[i];
+    m->stats.resolutionScale = m->sceneScale;
     m->inFrame = true;
     return true;
 }
@@ -797,7 +809,8 @@ void Renderer::Impl::ensureScene() {
     rhi::CommandList& cmd = device.cmd();
     beginPass(GpuPass::Opaque);
     cmd.beginTarget(mainChain.scene, sceneClear, 0.0f); // HDR 장면 대상, reversed-Z: 먼 쪽이 0
-    cmd.setViewport(sceneViewport[0], sceneViewport[1], sceneViewport[2], sceneViewport[3]);
+    cmd.setViewport(sceneViewport[0] * sceneScale, sceneViewport[1] * sceneScale, std::max(1.0f, sceneViewport[2] * sceneScale),
+                    std::max(1.0f, sceneViewport[3] * sceneScale));
     if (sceneSky) drawSky(sceneParams);
     cmd.setPipeline(scenePipeline());
 }
@@ -1133,6 +1146,51 @@ void Renderer::Impl::resizeChain(PostChain& chain, u32 width, u32 height) {
     chain.height = height;
 }
 
+// 동적 해상도 조절기: GPU 시간은 2프레임 늦어 평균을 내고, 바꾼 뒤 몇 프레임은 그 결과를 기다린다.
+// 넘으면 시간이 배율² (픽셀 수)에 비례한다고 보고 한 번에 맞추고, 여유가 크면 조금씩 올린다 (오르내림 반복을 막는 띠 75~95%)
+void Renderer::Impl::updateResolution() {
+    const ResolutionSettings& r = resolution;
+    const f32 top = std::clamp(r.maxScale, 0.25f, 1.0f), bottom = std::clamp(std::min(r.minScale, top), 0.25f, 1.0f);
+    if (!r.dynamic) {
+        renderScale = top;
+        return;
+    }
+    renderScale = std::clamp(renderScale, bottom, top);
+    const rhi::GpuTimes& gpu = device.gpuTimes();
+    if (!gpu.valid || gpu.frameMs <= 0.0f || r.budgetMs <= 0.0f) return;
+    gpuAverage = gpuAverage > 0.0f ? gpuAverage * 0.8f + gpu.frameMs * 0.2f : gpu.frameMs;
+    if (scaleCooldown) {
+        --scaleCooldown;
+        return;
+    }
+    f32 next = renderScale;
+    if (gpuAverage > r.budgetMs * 0.95f) next = renderScale * std::sqrt(r.budgetMs * 0.85f / gpuAverage);
+    else if (gpuAverage < r.budgetMs * 0.75f) next = renderScale + 0.02f;
+    next = std::clamp(std::round(next * 64.0f) / 64.0f, bottom, top); // 1/64 단위 (작은 떨림은 버린다)
+    if (next != renderScale) {
+        renderScale = next;
+        gpuAverage = 0.0f;
+        scaleCooldown = 8;
+    }
+}
+
+void Renderer::setDynamicResolution(bool dynamic, f32 minScale, f32 budgetMs, f32 sharpness) {
+    if (!m) return;
+    m->resolution.dynamic = dynamic;
+    m->resolution.minScale = minScale;
+    m->resolution.budgetMs = budgetMs;
+    m->resolution.sharpness = sharpness;
+}
+
+void Renderer::setRenderScale(f32 maxScale) {
+    if (m) m->resolution.maxScale = std::clamp(maxScale, 0.25f, 1.0f);
+}
+
+const ResolutionSettings& Renderer::resolution() const {
+    static const ResolutionSettings none{};
+    return m ? m->resolution : none;
+}
+
 void Renderer::Impl::ensureBloom(PostChain& chain) {
     if (chain.bloom[0]) return;
     for (u32 i = 0; i < kBloomLevels; ++i) {
@@ -1143,11 +1201,14 @@ void Renderer::Impl::ensureBloom(PostChain& chain) {
 }
 
 void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed,
-                             f32 time) {
+                             f32 time, f32 scale) {
     rhi::CommandList& cmd = device.cmd();
     if (timed) beginPass(GpuPass::Post);
     const f32 w = static_cast<f32>(chain.width), h = static_cast<f32>(chain.height);
-    const f32 region[4] = {rect[0] / w, rect[1] / h, (rect[0] + rect[2]) / w, (rect[1] + rect[3]) / h};
+    // 장면 영역 uv (줄인 영역). 우버 패스는 출력 픽셀 × scale / 크기로 읽는다
+    const f32 region[4] = {rect[0] * scale / w, rect[1] * scale / h, (rect[0] + std::max(1.0f, rect[2] * scale)) / w,
+                           (rect[1] + std::max(1.0f, rect[3] * scale)) / h};
+    const bool sharpen = scale < 0.999f && resolution.sharpness > 0.0f;
     const bool tone = post.toneMapping;
     const bool bloom = tone && postOptions.bloom && post.bloomIntensity > 0.0f;
     const u32 lut = post.lut < luts.size() ? post.lut : 0;
@@ -1159,17 +1220,18 @@ void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32
                              std::clamp(post.vignette, 0.0f, 1.0f), std::clamp(post.vignetteSmoothness, 0.0f, 1.0f)};
     const f32 effects[4] = {postOptions.filmGrain ? std::clamp(post.grain, 0.0f, 1.0f) : 0.0f,
                             postOptions.chromaticAberration ? std::clamp(post.chromaticAberration, 0.0f, 0.1f) : 0.0f,
-                            std::fmod(time, 64.0f), 0.0f};
-    const u32 flags = tone ? kPostToneMap | kPostDither | (postOptions.antiAliasing ? kPostFxaa : 0u) : 0u;
-    const u32 textures[4] = {bloomReady ? device.textureIndex(device.renderTargetTexture(chain.bloom[0])) : kNoTexture,
+                            std::fmod(time, 64.0f), std::clamp(resolution.sharpness, 0.0f, 1.0f)};
+    const u32 flags = (tone ? kPostToneMap | kPostDither | (postOptions.antiAliasing ? kPostFxaa : 0u) : 0u) | (sharpen ? kPostSharpen : 0u);
+    const u32 postTextures[4] = {bloomReady ? device.textureIndex(device.renderTargetTexture(chain.bloom[0])) : kNoTexture,
                              tone && (lut != 0 || postOptions.colorBlind != ColorBlindMode::Off) ? device.textureIndex(luts[lut].texture)
                                                                                                  : kNoTexture,
                              flags, 0};
     const f32 bloomColor[4] = {post.bloomTint.x, post.bloomTint.y, post.bloomTint.z, std::max(post.bloomThreshold, 0.0f)};
-    const f32 sceneSize[4] = {w, h, 1.0f / w, 1.0f / h};
+    const f32 sceneSize[4] = {w, h, scale / w, scale / h};
     std::memcpy(pc.exposure, exposure, sizeof(exposure));
     if (tone) std::memcpy(pc.effects, effects, sizeof(effects));
-    std::memcpy(pc.textures, textures, sizeof(textures));
+    pc.effects[3] = effects[3];
+    std::memcpy(pc.textures, postTextures, sizeof(postTextures));
     std::memcpy(pc.bloom, bloomColor, sizeof(bloomColor));
     std::memcpy(pc.region, region, sizeof(region));
     std::memcpy(pc.sceneSize, sceneSize, sizeof(sceneSize));
@@ -1242,7 +1304,7 @@ void Renderer::Impl::resolveScene() {
     device.cmd().endTarget(mainChain.scene);
     PostParams post = sceneParams.post;
     if (debugView != DebugView::None) post.toneMapping = false; // 보기 모드는 색을 그대로
-    runPost(mainChain, post, sceneViewport, {}, true, sceneParams.time);
+    runPost(mainChain, post, sceneViewport, {}, true, sceneParams.time, sceneScale);
 }
 
 rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {

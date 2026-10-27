@@ -168,7 +168,18 @@ struct PostOptions {
     f32 brightness = 1.0f; // 노출에 곱한다
     ColorBlindMode colorBlind = ColorBlindMode::Off; // LUT 위에 겹친다 (CPU가 합쳐 LUT 하나)
 };
-inline constexpr u32 kLutSize = 32; // 색 보정 LUT 한 변 (.cube는 이 크기로 다시 뽑는다)
+inline constexpr u32 kLutSize = 32;
+
+// 동적 해상도 (docs/ROADMAP.md 2단계 "동적 해상도"): 본 화면 3D를 HDR 대상의 줄인 영역에 그리고 우버 패스가 원래 해상도로
+// 늘려(이중 선형 + 대비 적응 샤프닝) 낸다. UI는 늘 원래 해상도. 조절기는 GPU 프레임 시간이 budgetMs를 넘으면 배율을 낮추고
+// 여유가 있으면 maxScale까지 천천히 올린다. 오프스크린(drawToTarget)과 보기 모드는 늘 1
+struct ResolutionSettings {
+    bool dynamic = false;  // 프로젝트 설정 dynamicResolution (꺼지면 maxScale 고정)
+    f32 minScale = 0.5f;   // 프로젝트 설정 dynamicResolutionMinScale
+    f32 maxScale = 1.0f;   // 플레이어 설정 렌더 배율 (setRenderScale)
+    f32 budgetMs = 8.0f;   // 프로젝트 GPU 예산의 합
+    f32 sharpness = 0.5f;  // 줄였을 때 샤프닝 0..1
+}; // 색 보정 LUT 한 변 (.cube는 이 크기로 다시 뽑는다)
 
 struct FrameParams {
     Viewport viewport;
@@ -240,6 +251,7 @@ struct RenderStats {
     bool gpuValid = false;
     f32 gpuFrameMs = 0.0f;
     f32 gpuPassMs[kGpuPassCount] = {};
+    f32 resolutionScale = 1.0f; // 이번 프레임 본 화면 3D 배율 (동적 해상도)
 };
 
 // 2D UI 사각형 하나 (HLSL UiQuad와 같은 112바이트, shaders/Ui.hlsl). mealkit/ui/가 채운다. 좌표는 백버퍼 픽셀.
@@ -322,6 +334,10 @@ public:
     u32 createLut(const f32* rgb);
     void setPostOptions(const PostOptions& options); // 플레이어 설정 (색맹 보정이 바뀌면 LUT를 다시 만든다)
     const PostOptions& postOptions() const;
+    // 동적 해상도: 프로젝트 쪽 값(dynamic·minScale·budgetMs·sharpness, game::applyRenderStyle)과 플레이어 렌더 배율(settings)을 따로 넣는다
+    void setDynamicResolution(bool dynamic, f32 minScale, f32 budgetMs, f32 sharpness);
+    void setRenderScale(f32 maxScale); // 0.5..1
+    const ResolutionSettings& resolution() const;
     // 오프스크린 그림 (에디터 룩데브 창, 반사 프로브 굽기): 8비트 sRGB 대상과 같은 크기의 HDR 장면 대상을 짝으로 만든다.
     // 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
     rhi::RenderTarget createRenderTarget(u32 width, u32 height);
