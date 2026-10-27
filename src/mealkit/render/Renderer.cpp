@@ -332,6 +332,64 @@ struct Renderer::Impl {
         return d;
     }
 
+    // 보기 모드 파이프라인 (와이어·오버드로): PBR 셰이더(forwardDesc[0])에서 만든다. 스킨 변형은 스킨 정점 셰이더로
+    void recreateViewModePipelines() {
+#if MEALKIT_DEBUG_UI
+        device.recreatePipeline(forwardWire, wireDesc());
+        device.recreatePipeline(forwardOverdraw, overdrawDesc());
+        device.recreatePipeline(wireSkin, skinnedDesc(wireDesc(), forwardSkinDesc[0].vs));
+        device.recreatePipeline(overdrawSkin, skinnedDesc(overdrawDesc(), forwardSkinDesc[0].vs));
+#endif
+    }
+
+    // 셰이더 핫 리로드 (개발 빌드: engine/shaders가 바뀌면 다시 컴파일해 바꿔 끼운다, 출시 빌드와 엔진 폴더가 없는 PC에서는
+    // 아무것도 하지 않는다). 파이프라인 하나에 한 줄: desc에 새 바이트코드를 넣어 두고(바이트코드는 ShaderReloader가 갖고 있다)
+    // 다시 만든다. PBR 변형(일반·스킨)이 바뀌면 거기서 나온 보기 모드 파이프라인도 같이
+    void addShaderReloads() {
+        // 정의 두 개는 한 줄로: "-D"를 사이에 둔다
+        static const char* const kSkinDefines[kLightingModelCount] = {"LIGHTING_MODEL=0 -D SKINNED=1", "LIGHTING_MODEL=1 -D SKINNED=1",
+                                                                      "LIGHTING_MODEL=2 -D SKINNED=1"};
+        struct Reload {
+            const char* file;
+            rhi::Pipeline* pipeline;
+            rhi::PipelineDesc* desc;
+            const char* vs;
+            const char* ps;
+            const char* defines;
+        };
+        std::vector<Reload> reloads;
+        for (u32 i = 0; i < kLightingModelCount; ++i) {
+            reloads.push_back({"Forward.hlsl", &forward[i], &forwardDesc[i], "VSMain", "PSMain", kLightingDefines[i]});
+            reloads.push_back({"Forward.hlsl", &forwardSkin[i], &forwardSkinDesc[i], "VSMain", "PSMain", kSkinDefines[i]});
+        }
+        const Reload others[] = {
+            {"Forward.hlsl", &outline, &outlineDesc, "VSOutline", "PSOutline", ""},
+            {"Forward.hlsl", &outlineSkin, &outlineSkinDesc, "VSOutline", "PSOutline", "SKINNED=1"},
+            {"Forward.hlsl", &shadowPipeline, &shadowDesc, "VSShadow", "PSShadow", ""},
+            {"Forward.hlsl", &shadowSkin, &shadowSkinDesc, "VSShadow", "PSShadow", "SKINNED=1"},
+            {"Forward.hlsl", &sky, &skyDesc, "VSSky", "PSSky", ""},
+            {"Particle.hlsl", &particles, &particleDesc, "VSMain", "PSMain", ""},
+            {"Ui.hlsl", &ui, &uiDesc, "VSMain", "PSMain", ""},
+            {"Post.hlsl", &bloomDown, &bloomDownDesc, "VSMain", "PSBloomDown", ""},
+            {"Post.hlsl", &bloomUp, &bloomUpDesc, "VSMain", "PSBloomUp", ""},
+            {"Post.hlsl", &uber, &uberDesc, "VSMain", "PSUber", ""},
+        };
+        reloads.insert(reloads.end(), std::begin(others), std::end(others));
+        for (const Reload& r : reloads) {
+            const bool viewModeSource = r.desc == &forwardDesc[0] || r.desc == &forwardSkinDesc[0];
+            shaderReload.add(
+                r.file,
+                [this, r, viewModeSource](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+                    r.desc->vs = vs;
+                    r.desc->ps = ps;
+                    const bool ok = device.recreatePipeline(*r.pipeline, *r.desc);
+                    if (ok && viewModeSource) recreateViewModePipelines();
+                    return ok;
+                },
+                r.vs, r.ps, r.defines);
+        }
+    }
+
     // 기다리던 아틀라스 영역을 이번 프레임 업로드 링으로 복사한다 (자리가 없으면 다음 프레임에)
     void beginPass(GpuPass pass) {
         endPass();
@@ -423,35 +481,6 @@ bool Renderer::init(const RendererDesc& desc) {
     ui.premultipliedBlend = true; // 미리 곱한 알파
     m->ui = m->device.createPipeline(ui);
     m->uiDesc = ui;
-    // 개발 빌드: engine/shaders가 바뀌면 다시 컴파일해 바꿔 끼운다 (출시 빌드와 엔진 폴더가 없는 PC에서는 아무것도 하지 않는다)
-    for (u32 i = 0; i < kLightingModelCount; ++i) {
-        m->shaderReload.add(
-            "Forward.hlsl",
-            [this, i](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-                rhi::PipelineDesc d = m->forwardDesc[i];
-                d.vs = vs;
-                d.ps = ps;
-                m->forwardDesc[i] = d; // 바이트코드는 ShaderReloader가 갖고 있다
-#if MEALKIT_DEBUG_UI
-                if (i == 0) { // 보기 모드 파이프라인은 PBR 셰이더
-                    m->device.recreatePipeline(m->forwardWire, m->wireDesc());
-                    m->device.recreatePipeline(m->forwardOverdraw, m->overdrawDesc());
-                }
-#endif
-                return m->device.recreatePipeline(m->forward[i], d);
-            },
-            "VSMain", "PSMain", kLightingDefines[i]);
-    }
-    m->shaderReload.add(
-        "Forward.hlsl",
-        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-            rhi::PipelineDesc d = m->outlineDesc;
-            d.vs = vs;
-            d.ps = ps;
-            m->outlineDesc = d;
-            return m->device.recreatePipeline(m->outline, d);
-        },
-        "VSOutline", "PSOutline");
     rhi::PipelineDesc sky;
     sky.vs = {g_SkyVS, sizeof(g_SkyVS)};
     sky.ps = {g_SkyPS, sizeof(g_SkyPS)};
@@ -460,16 +489,6 @@ bool Renderer::init(const RendererDesc& desc) {
     sky.depthTest = false; // 먼저 그리고 3D가 덮는다 (깊이도 쓰지 않는다)
     m->skyDesc = sky;
     m->sky = m->device.createPipeline(sky);
-    m->shaderReload.add(
-        "Forward.hlsl",
-        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-            rhi::PipelineDesc d = m->skyDesc;
-            d.vs = vs;
-            d.ps = ps;
-            m->skyDesc = d;
-            return m->device.recreatePipeline(m->sky, d);
-        },
-        "VSSky", "PSSky");
     rhi::PipelineDesc shadow = forward; // 그림자: 같은 정점 형식, 깊이만 (알파 마스크·디졸브만 픽셀 셰이더에서 버린다)
     shadow.vs = {g_ShadowVS, sizeof(g_ShadowVS)};
     shadow.ps = {g_ShadowPS, sizeof(g_ShadowPS)};
@@ -490,50 +509,6 @@ bool Renderer::init(const RendererDesc& desc) {
     m->wireSkin = m->device.createPipeline(skinnedDesc(m->wireDesc(), skinVS));
     m->overdrawSkin = m->device.createPipeline(skinnedDesc(m->overdrawDesc(), skinVS));
 #endif
-    // 셰이더 핫 리로드: 스킨 변형 (정의 두 개는 한 줄로: "-D"를 사이에 둔다)
-    static const char* const kSkinDefines[kLightingModelCount] = {"LIGHTING_MODEL=0 -D SKINNED=1", "LIGHTING_MODEL=1 -D SKINNED=1",
-                                                                  "LIGHTING_MODEL=2 -D SKINNED=1"};
-    for (u32 i = 0; i < kLightingModelCount; ++i)
-        m->shaderReload.add(
-            "Forward.hlsl",
-            [this, i](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-                rhi::PipelineDesc d = m->forwardSkinDesc[i];
-                d.vs = vs;
-                d.ps = ps;
-                m->forwardSkinDesc[i] = d;
-                return m->device.recreatePipeline(m->forwardSkin[i], d);
-            },
-            "VSMain", "PSMain", kSkinDefines[i]);
-    m->shaderReload.add(
-        "Forward.hlsl",
-        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-            rhi::PipelineDesc d = m->outlineSkinDesc;
-            d.vs = vs;
-            d.ps = ps;
-            m->outlineSkinDesc = d;
-            return m->device.recreatePipeline(m->outlineSkin, d);
-        },
-        "VSOutline", "PSOutline", "SKINNED=1");
-    m->shaderReload.add(
-        "Forward.hlsl",
-        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-            rhi::PipelineDesc d = m->shadowSkinDesc;
-            d.vs = vs;
-            d.ps = ps;
-            m->shadowSkinDesc = d;
-            return m->device.recreatePipeline(m->shadowSkin, d);
-        },
-        "VSShadow", "PSShadow", "SKINNED=1");
-    m->shaderReload.add(
-        "Forward.hlsl",
-        [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-            rhi::PipelineDesc d = m->shadowDesc;
-            d.vs = vs;
-            d.ps = ps;
-            m->shadowDesc = d;
-            return m->device.recreatePipeline(m->shadowPipeline, d);
-        },
-        "VSShadow", "PSShadow");
     rhi::PipelineDesc particles;
     particles.vs = {g_ParticleVS, sizeof(g_ParticleVS)};
     particles.ps = {g_ParticlePS, sizeof(g_ParticlePS)};
@@ -543,18 +518,6 @@ bool Renderer::init(const RendererDesc& desc) {
     particles.depthWrite = false;
     m->particleDesc = particles;
     m->particles = m->device.createPipeline(particles);
-    m->shaderReload.add("Particle.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-        rhi::PipelineDesc d = m->particleDesc;
-        d.vs = vs;
-        d.ps = ps;
-        return m->device.recreatePipeline(m->particles, d);
-    });
-    m->shaderReload.add("Ui.hlsl", [this](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-        rhi::PipelineDesc d = m->uiDesc;
-        d.vs = vs;
-        d.ps = ps;
-        return m->device.recreatePipeline(m->ui, d);
-    });
     // 포스트: 화면 가득 삼각형 (정점 버퍼·깊이 없음). 블룸 사슬은 HDR, 우버 패스는 백버퍼·Ldr 대상
     rhi::PipelineDesc post;
     post.vs = {g_PostVS, sizeof(g_PostVS)};
@@ -572,23 +535,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->bloomDown = m->device.createPipeline(m->bloomDownDesc);
     m->bloomUp = m->device.createPipeline(m->bloomUpDesc);
     m->uber = m->device.createPipeline(m->uberDesc);
-    const struct {
-        rhi::Pipeline Impl::*pipeline;
-        rhi::PipelineDesc Impl::*desc;
-        const char* entry;
-    } postShaders[] = {{&Impl::bloomDown, &Impl::bloomDownDesc, "PSBloomDown"},
-                       {&Impl::bloomUp, &Impl::bloomUpDesc, "PSBloomUp"},
-                       {&Impl::uber, &Impl::uberDesc, "PSUber"}};
-    for (const auto& s : postShaders)
-        m->shaderReload.add(
-            "Post.hlsl",
-            [this, s](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
-                rhi::PipelineDesc& d = m->*s.desc;
-                d.vs = vs;
-                d.ps = ps;
-                return m->device.recreatePipeline(m->*s.pipeline, d);
-            },
-            "VSMain", s.entry);
+    m->addShaderReloads();
 
     createMaterial({}); // 0번: 기본 흰색 (머티리얼 없는 메시, 상자)
     std::vector<f32> identity(static_cast<size_t>(kLutSize) * kLutSize * kLutSize * 3);
