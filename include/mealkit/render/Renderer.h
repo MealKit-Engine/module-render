@@ -143,6 +143,33 @@ struct ShadowSettings {
 };
 inline constexpr u32 kMaxShadowCascades = 2;
 
+// 포스트 프로세싱 (docs/ROADMAP.md 2단계 "포스트 프로세싱", shaders/Post.hlsl): 씬 환경의 값(scene::PostFields)을 게임·에디터가
+// 채운다. 화면용 값이라 결정론과 무관하다. 장면은 HDR(선형)로 그리고 우버 패스 하나가 톤 매핑해 백버퍼로 낸다
+struct PostParams {
+    bool toneMapping = true; // false: 선형 값을 잘라 sRGB로만 (반사 프로브 굽기). 블룸·LUT·효과도 끈다
+    f32 exposure = 0.0f;     // EV (2배 = +1)
+    u32 lut = 0;             // 색 보정 LUT (createLut 번호, 0 = 없음)
+    f32 bloomIntensity = 0.25f; // 0 = 블룸 패스를 건너뛴다
+    f32 bloomThreshold = 1.0f;  // 이보다 밝은 빛만 (선형, 노출 전)
+    Vec3 bloomTint{1.0f, 1.0f, 1.0f};
+    f32 vignette = 0.0f;           // 0..1 가장자리 어둡게
+    f32 vignetteSmoothness = 0.5f; // 시작 반지름 0..1
+    f32 grain = 0.0f;              // 필름 그레인 0..1
+    f32 chromaticAberration = 0.0f; // 색수차 (영역 크기 비율, 0.01 = 가장자리에서 1%)
+};
+
+// 플레이어 설정 (settings::DisplaySettings·GameplaySettings): 효과 끄기, 밝기, 색맹 보정. 씬 값보다 먼저 적용된다
+enum class ColorBlindMode : u8 { Off, Protanopia, Deuteranopia, Tritanopia }; // settings::ColorBlindSetting과 같은 순서
+struct PostOptions {
+    bool bloom = true;
+    bool antiAliasing = true; // FXAA (우버 패스 안)
+    bool filmGrain = true;
+    bool chromaticAberration = true;
+    f32 brightness = 1.0f; // 노출에 곱한다
+    ColorBlindMode colorBlind = ColorBlindMode::Off; // LUT 위에 겹친다 (CPU가 합쳐 LUT 하나)
+};
+inline constexpr u32 kLutSize = 32; // 색 보정 LUT 한 변 (.cube는 이 크기로 다시 뽑는다)
+
 struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
@@ -173,6 +200,7 @@ struct FrameParams {
     // 점광원 (부르는 쪽 메모리, 프레임 동안 읽는다). kMaxPointLights를 넘으면 앞에서부터
     const PointLight* lights = nullptr;
     u32 lightCount = 0;
+    PostParams post; // 보기 모드에서는 쓰지 않는다 (색을 그대로)
 };
 
 // 하늘 HDRI에서 구운 환경 (asset::EnvironmentMap, 큐브는 RGB9E5, 면 +X −X +Y −Y +Z −Z 차례로). createEnvironment가 GPU에 올린다
@@ -289,13 +317,19 @@ public:
     bool meshSkinned(MeshId mesh) const;
     // 파티클 (DrawList::submit이 불투명 3D 다음에 부른다): 드로우 콜 1회, GPU 패스 Vfx
     void drawParticles(const Particle* particles, u32 count);
-    // 오프스크린 그림 (에디터 룩데브 창): 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
+    // 색 보정 LUT (asset::loadCubeLut): kLutSize³ 칸의 sRGB 값 rgb (빨강이 가장 빨리 바뀐다). 번호는 PostParams::lut.
+    // 지우지 않는다: 같은 파일은 쓰는 쪽(ModelCache)이 번호를 다시 쓴다
+    u32 createLut(const f32* rgb);
+    void setPostOptions(const PostOptions& options); // 플레이어 설정 (색맹 보정이 바뀌면 LUT를 다시 만든다)
+    const PostOptions& postOptions() const;
+    // 오프스크린 그림 (에디터 룩데브 창, 반사 프로브 굽기): 8비트 sRGB 대상과 같은 크기의 HDR 장면 대상을 짝으로 만든다.
+    // 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
     rhi::RenderTarget createRenderTarget(u32 width, u32 height);
     rhi::Texture renderTargetTexture(rhi::RenderTarget target) const; // ImGui::Image (rhi::imguiTextureId)
-    // 본 화면 3D(DrawList::submit) 다음, UI 전에: 대상 전체에 params의 카메라·빛과 lighting 조명 모델로 list를 그린다.
-    // 백버퍼는 풀리므로 이 뒤에 본 화면 3D를 그리지 않는다 (UI는 beginOverlay가 다시 묶는다)
+    // 본 화면 3D(DrawList::submit) 다음, UI 전에: 대상 전체에 params의 카메라·빛·포스트와 lighting 조명 모델로 list를 그린다.
+    // 본 화면은 여기서 포스트를 거쳐 백버퍼로 나가므로 이 뒤에 본 화면 3D를 그리지 않는다 (UI는 beginOverlay가 다시 묶는다)
     void drawToTarget(rhi::RenderTarget target, const FrameParams& params, const DrawList& list, LightingModel lighting);
-    // 3D 이후 UI를 그리기 위해 깊이 없는 sRGB 미변환 백버퍼 뷰를 묶는다.
+    // 3D 이후 UI를 그리기 위해 백버퍼를 묶는다 (본 화면 3D는 여기서 포스트를 거쳐 백버퍼로 나간다)
     void beginOverlay();
     // UI 아틀라스의 한 영역을 바꾼다 (언제든, 다음 drawUi 전에 GPU에 올린다). pixels는 w×h, 행 사이 빈틈 없음
     void updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels);

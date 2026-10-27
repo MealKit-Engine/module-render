@@ -26,6 +26,10 @@
 #include "g_SkyVS.h"
 #include "g_ParticlePS.h"
 #include "g_ParticleVS.h"
+#include "g_BloomDownPS.h"
+#include "g_BloomUpPS.h"
+#include "g_PostVS.h"
+#include "g_UberPS.h"
 #include "g_UiPS.h"
 #include "g_UiVS.h"
 
@@ -131,6 +135,50 @@ struct UiPush {
     u32 pad[2] = {};
 };
 
+// shaders/Post.hlsl PostPush (48바이트)
+struct PostPush {
+    u32 ring = 0;
+    u32 constOffset = 0;
+    u32 source = 0;
+    u32 first = 0;
+    f32 rect[4] = {};
+    f32 texel[2] = {};
+    f32 scale[2] = {};
+};
+
+// shaders/Post.hlsl PostConstants (업로드 링, 96바이트)
+struct PostConstants {
+    f32 exposure[4]; // 노출 배율, 블룸 세기, 비네트 세기, 비네트 부드러움
+    f32 effects[4];  // 그레인, 색수차, 시간, 0
+    u32 textures[4]; // 블룸 사슬 맨 위, LUT, 플래그, 0 (없음 = kNoTexture)
+    f32 bloom[4];    // 블룸 색, 문턱
+    f32 region[4];   // 장면 영역 uv
+    f32 sceneSize[4];
+};
+static_assert(sizeof(PostConstants) == 96);
+constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u; // Post.hlsl kPost*
+constexpr u32 kLutWidth = kLutSize * kLutSize; // 32³을 가로 띠 1024 × 32로 (파랑 조각마다 32칸)
+
+// 색맹 보정 (Fidaner 계열 daltonize): 선형 RGB에서 Machado 2009(심한 정도 1.0)로 그 사람이 보는 색을 흉내 내고,
+// 못 보는 차이를 볼 수 있는 채널로 옮긴다. 입력·출력은 0..1 sRGB 값 (LUT 칸)
+void daltonize(ColorBlindMode mode, f32 c[3]) {
+    static const f32 kSimulate[3][9] = {
+        {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},  // 1형 (빨강)
+        {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},   // 2형 (초록)
+        {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f}}; // 3형 (파랑)
+    if (mode == ColorBlindMode::Off) return;
+    const f32* s = kSimulate[static_cast<u32>(mode) - 1];
+    f32 lin[3];
+    for (u32 i = 0; i < 3; ++i) lin[i] = c[i] <= 0.04045f ? c[i] / 12.92f : std::pow((c[i] + 0.055f) / 1.055f, 2.4f);
+    f32 err[3];
+    for (u32 i = 0; i < 3; ++i) err[i] = lin[i] - (s[i * 3] * lin[0] + s[i * 3 + 1] * lin[1] + s[i * 3 + 2] * lin[2]);
+    const f32 out[3] = {lin[0], lin[1] + 0.7f * err[0] + err[1], lin[2] + 0.7f * err[0] + err[2]};
+    for (u32 i = 0; i < 3; ++i) {
+        const f32 v = std::clamp(out[i], 0.0f, 1.0f);
+        c[i] = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+    }
+}
+
 constexpr u32 kRingAlignment = 16;
 
 struct GpuMesh {
@@ -188,6 +236,37 @@ struct Renderer::Impl {
     bool shadowPending = false;                // 이번 프레임 그림자 맵을 아직 그리지 않았다
     void computeCascades(const FrameParams& p, FrameConstants& fc);
 
+    // 포스트 프로세싱 (shaders/Post.hlsl): HDR 장면 대상 + 블룸 사슬(절반부터 반씩, 처음 쓸 때 만든다).
+    // 본 화면은 창 크기(beginFrame이 맞춘다), 오프스크린은 출력 대상(Ldr)마다 같은 크기의 짝
+    static constexpr u32 kBloomLevels = 5;
+    struct PostChain {
+        rhi::RenderTarget scene;
+        rhi::RenderTarget bloom[kBloomLevels];
+        u32 width = 0, height = 0;
+        u32 bloomSize[kBloomLevels][2] = {};
+    };
+    PostChain mainChain;
+    struct Offscreen {
+        rhi::RenderTarget output; // createRenderTarget이 준 Ldr 대상 (0 = 이 번호는 다른 대상)
+        PostChain chain;
+    };
+    std::vector<Offscreen> offscreen; // RenderTarget::id로
+    rhi::Pipeline bloomDown, bloomUp, uber;
+    rhi::PipelineDesc bloomDownDesc, bloomUpDesc, uberDesc;
+    PostOptions postOptions;
+    struct Lut {
+        std::vector<f32> rgb; // kLutSize³ × 3 (색맹 보정을 바꾸면 다시 합친다)
+        rhi::Texture texture; // kLutWidth × kLutSize RGBA8
+    };
+    std::vector<Lut> luts; // 0 = 항등 (색맹 보정만 할 때)
+    void uploadLut(u32 index);
+    void resizeChain(PostChain& chain, u32 width, u32 height); // 프레임 밖에서 (옛 대상은 지운다)
+    void ensureBloom(PostChain& chain);
+    // 장면 대상(chain.scene, endTarget까지 끝난)을 output(없으면 백버퍼의 rect 영역)으로. timed: GPU 패스 Post로 잰다
+    void runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed, f32 time);
+    bool sceneResolved = false; // 본 화면을 포스트로 백버퍼에 냈다 (이 뒤로 본 화면 3D 없음)
+    void resolveScene();        // ensureScene 다음에
+
     // 본 화면 3D 대상은 처음 그릴 때 묶는다 (그림자 패스가 먼저 다른 대상에 그릴 수 있게)
     bool sceneBound = false;
     f32 sceneClear[4] = {};
@@ -220,7 +299,6 @@ struct Renderer::Impl {
 
     u64 frameOffset = 0; // 이번 프레임 FrameConstants의 링 위치
     u64 materialOffset = 0; // 이번 프레임 머티리얼 표의 링 위치 (본 화면과 오프스크린이 같이)
-    std::vector<std::pair<u32, u32>> targetSizes; // RenderTarget::id → 크기 (drawToTarget의 뷰포트)
     // 업로드 링에 쓰고 위치를 offset에. withShadows: 본 화면 (태양 그림자 단계를 정해 넣는다)
     void writeFrameConstants(const FrameParams& p, u64* offset, bool withShadows);
     bool vsync = true;
@@ -468,8 +546,49 @@ bool Renderer::init(const RendererDesc& desc) {
         d.ps = ps;
         return m->device.recreatePipeline(m->ui, d);
     });
+    // 포스트: 화면 가득 삼각형 (정점 버퍼·깊이 없음). 블룸 사슬은 HDR, 우버 패스는 백버퍼·Ldr 대상
+    rhi::PipelineDesc post;
+    post.vs = {g_PostVS, sizeof(g_PostVS)};
+    post.cullBack = false;
+    post.depthTest = false;
+    post.target = rhi::Target::Hdr;
+    m->bloomDownDesc = post;
+    m->bloomDownDesc.ps = {g_BloomDownPS, sizeof(g_BloomDownPS)};
+    m->bloomUpDesc = post;
+    m->bloomUpDesc.ps = {g_BloomUpPS, sizeof(g_BloomUpPS)};
+    m->bloomUpDesc.additiveBlend = true; // 그 단계의 내려온 값 위에 쌓는다
+    m->uberDesc = post;
+    m->uberDesc.ps = {g_UberPS, sizeof(g_UberPS)};
+    m->uberDesc.target = rhi::Target::Overlay;
+    m->bloomDown = m->device.createPipeline(m->bloomDownDesc);
+    m->bloomUp = m->device.createPipeline(m->bloomUpDesc);
+    m->uber = m->device.createPipeline(m->uberDesc);
+    const struct {
+        rhi::Pipeline Impl::*pipeline;
+        rhi::PipelineDesc Impl::*desc;
+        const char* entry;
+    } postShaders[] = {{&Impl::bloomDown, &Impl::bloomDownDesc, "PSBloomDown"},
+                       {&Impl::bloomUp, &Impl::bloomUpDesc, "PSBloomUp"},
+                       {&Impl::uber, &Impl::uberDesc, "PSUber"}};
+    for (const auto& s : postShaders)
+        m->shaderReload.add(
+            "Post.hlsl",
+            [this, s](const rhi::ShaderCode& vs, const rhi::ShaderCode& ps) {
+                rhi::PipelineDesc& d = m->*s.desc;
+                d.vs = vs;
+                d.ps = ps;
+                return m->device.recreatePipeline(m->*s.pipeline, d);
+            },
+            "VSMain", s.entry);
 
     createMaterial({}); // 0번: 기본 흰색 (머티리얼 없는 메시, 상자)
+    std::vector<f32> identity(static_cast<size_t>(kLutSize) * kLutSize * kLutSize * 3);
+    for (u32 i = 0; i < kLutSize * kLutSize * kLutSize; ++i) {
+        identity[i * 3 + 0] = static_cast<f32>(i % kLutSize) / (kLutSize - 1);
+        identity[i * 3 + 1] = static_cast<f32>(i / kLutSize % kLutSize) / (kLutSize - 1);
+        identity[i * 3 + 2] = static_cast<f32>(i / (kLutSize * kLutSize)) / (kLutSize - 1);
+    }
+    createLut(identity.data()); // 0번: 항등 (색맹 보정만 할 때)
     m->uiAtlas[0] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::R8Unorm);
     m->uiAtlas[1] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::Rgba8Unorm);
     m->toonRamp = m->device.createTexture(kToonRampWidth, 1, rhi::Format::Rgba8Unorm);
@@ -610,7 +729,9 @@ MeshId Renderer::createMesh(const MeshData& data) {
 
 bool Renderer::beginFrame(const FrameParams& p) {
     if (m) m->shaderReload.update(); // 프레임 밖에서 (파이프라인을 바꿀 때 GPU를 기다린다)
-    if (!m || !m->device.beginFrame()) return false;
+    if (m && width() && height() && (m->mainChain.width != width() || m->mainChain.height != height()))
+        m->resizeChain(m->mainChain, width(), height()); // HDR 장면 대상은 창 크기 (지우기는 프레임 밖에서)
+    if (!m || !m->mainChain.scene || !m->device.beginFrame()) return false;
     rhi::CommandList& cmd = m->device.cmd();
 
     const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // 배경도 번쩍임을 받는다
@@ -653,6 +774,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     }
     m->shadowPending = m->shadowCascades != 0;
     m->sceneBound = false;
+    m->sceneResolved = false;
     m->sceneSky = !overdraw;
     m->sceneParams = p;
     m->sceneParams.probes = nullptr;
@@ -674,7 +796,7 @@ void Renderer::Impl::ensureScene() {
     shadowPending = false; // 본 화면을 묶은 뒤에는 그림자 맵을 그리지 않는다 (이번 프레임은 비었거나 그린 것)
     rhi::CommandList& cmd = device.cmd();
     beginPass(GpuPass::Opaque);
-    cmd.beginScene(sceneClear, 0.0f); // reversed-Z: 먼 쪽이 0
+    cmd.beginTarget(mainChain.scene, sceneClear, 0.0f); // HDR 장면 대상, reversed-Z: 먼 쪽이 0
     cmd.setViewport(sceneViewport[0], sceneViewport[1], sceneViewport[2], sceneViewport[3]);
     if (sceneSky) drawSky(sceneParams);
     cmd.setPipeline(scenePipeline());
@@ -957,12 +1079,180 @@ u32 Renderer::createProbe(u32 size, u32 mips, const u32* reflect) {
     return static_cast<u32>(m->probes.size());
 }
 
+u32 Renderer::createLut(const f32* rgb) {
+    if (!m || !rgb) return 0;
+    Impl::Lut lut;
+    lut.rgb.assign(rgb, rgb + static_cast<size_t>(kLutSize) * kLutSize * kLutSize * 3);
+    lut.texture = m->device.createTexture(kLutWidth, kLutSize, rhi::Format::Rgba8Unorm);
+    m->luts.push_back(std::move(lut));
+    m->uploadLut(static_cast<u32>(m->luts.size() - 1));
+    return static_cast<u32>(m->luts.size() - 1);
+}
+
+void Renderer::Impl::uploadLut(u32 index) {
+    const Lut& lut = luts[index];
+    TextureUpload u;
+    u.texture = lut.texture;
+    u.bpp = 4;
+    u.x = u.y = 0;
+    u.w = kLutWidth;
+    u.h = kLutSize;
+    u.pixels.resize(static_cast<size_t>(kLutWidth) * kLutSize * 4);
+    for (u32 b = 0; b < kLutSize; ++b)
+        for (u32 g = 0; g < kLutSize; ++g)
+            for (u32 r = 0; r < kLutSize; ++r) {
+                const size_t cell = (static_cast<size_t>(b) * kLutSize + g) * kLutSize + r;
+                f32 c[3] = {lut.rgb[cell * 3], lut.rgb[cell * 3 + 1], lut.rgb[cell * 3 + 2]};
+                daltonize(postOptions.colorBlind, c);
+                u8* px = &u.pixels[(static_cast<size_t>(g) * kLutWidth + b * kLutSize + r) * 4];
+                for (u32 i = 0; i < 3; ++i) px[i] = static_cast<u8>(std::clamp(c[i], 0.0f, 1.0f) * 255.0f + 0.5f);
+                px[3] = 255;
+            }
+    uploads.push_back(std::move(u));
+}
+
+void Renderer::setPostOptions(const PostOptions& options) {
+    if (!m) return;
+    const bool relut = options.colorBlind != m->postOptions.colorBlind;
+    m->postOptions = options;
+    m->postOptions.brightness = std::clamp(options.brightness, 0.1f, 4.0f);
+    if (relut)
+        for (u32 i = 0; i < m->luts.size(); ++i) m->uploadLut(i);
+}
+
+const PostOptions& Renderer::postOptions() const {
+    static const PostOptions none{};
+    return m ? m->postOptions : none;
+}
+
+void Renderer::Impl::resizeChain(PostChain& chain, u32 width, u32 height) {
+    device.destroyRenderTarget(chain.scene);
+    for (rhi::RenderTarget& b : chain.bloom) device.destroyRenderTarget(b), b = {};
+    chain.scene = device.createRenderTarget(width, height, rhi::TargetKind::Scene);
+    chain.width = width;
+    chain.height = height;
+}
+
+void Renderer::Impl::ensureBloom(PostChain& chain) {
+    if (chain.bloom[0]) return;
+    for (u32 i = 0; i < kBloomLevels; ++i) {
+        chain.bloomSize[i][0] = std::max(1u, chain.width >> (i + 1));
+        chain.bloomSize[i][1] = std::max(1u, chain.height >> (i + 1));
+        chain.bloom[i] = device.createRenderTarget(chain.bloomSize[i][0], chain.bloomSize[i][1], rhi::TargetKind::Hdr);
+    }
+}
+
+void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed,
+                             f32 time) {
+    rhi::CommandList& cmd = device.cmd();
+    if (timed) beginPass(GpuPass::Post);
+    const f32 w = static_cast<f32>(chain.width), h = static_cast<f32>(chain.height);
+    const f32 region[4] = {rect[0] / w, rect[1] / h, (rect[0] + rect[2]) / w, (rect[1] + rect[3]) / h};
+    const bool tone = post.toneMapping;
+    const bool bloom = tone && postOptions.bloom && post.bloomIntensity > 0.0f;
+    const u32 lut = post.lut < luts.size() ? post.lut : 0;
+    if (bloom) ensureBloom(chain); // 처음 쓸 때 (만들기는 프레임 안에서도 된다: 그림자 맵과 같다)
+    const bool bloomReady = bloom && chain.bloom[0];
+
+    PostConstants pc{};
+    const f32 exposure[4] = {std::exp2(post.exposure) * postOptions.brightness, std::max(post.bloomIntensity, 0.0f),
+                             std::clamp(post.vignette, 0.0f, 1.0f), std::clamp(post.vignetteSmoothness, 0.0f, 1.0f)};
+    const f32 effects[4] = {postOptions.filmGrain ? std::clamp(post.grain, 0.0f, 1.0f) : 0.0f,
+                            postOptions.chromaticAberration ? std::clamp(post.chromaticAberration, 0.0f, 0.1f) : 0.0f,
+                            std::fmod(time, 64.0f), 0.0f};
+    const u32 flags = tone ? kPostToneMap | kPostDither | (postOptions.antiAliasing ? kPostFxaa : 0u) : 0u;
+    const u32 textures[4] = {bloomReady ? device.textureIndex(device.renderTargetTexture(chain.bloom[0])) : kNoTexture,
+                             tone && (lut != 0 || postOptions.colorBlind != ColorBlindMode::Off) ? device.textureIndex(luts[lut].texture)
+                                                                                                 : kNoTexture,
+                             flags, 0};
+    const f32 bloomColor[4] = {post.bloomTint.x, post.bloomTint.y, post.bloomTint.z, std::max(post.bloomThreshold, 0.0f)};
+    const f32 sceneSize[4] = {w, h, 1.0f / w, 1.0f / h};
+    std::memcpy(pc.exposure, exposure, sizeof(exposure));
+    if (tone) std::memcpy(pc.effects, effects, sizeof(effects));
+    std::memcpy(pc.textures, textures, sizeof(textures));
+    std::memcpy(pc.bloom, bloomColor, sizeof(bloomColor));
+    std::memcpy(pc.region, region, sizeof(region));
+    std::memcpy(pc.sceneSize, sceneSize, sizeof(sceneSize));
+    u64 constOffset = 0;
+    u8* cpu = device.allocUpload(sizeof(pc), kRingAlignment, &constOffset);
+    if (!cpu) {
+        warnOverflow(sizeof(pc));
+        if (timed) endPass();
+        return;
+    }
+    std::memcpy(cpu, &pc, sizeof(pc));
+    PostPush push;
+    push.ring = device.uploadBufferIndex();
+    push.constOffset = static_cast<u32>(constOffset);
+    std::memcpy(push.rect, region, sizeof(region));
+    const u32 sceneTexture = device.textureIndex(device.renderTargetTexture(chain.scene));
+
+    if (bloomReady) { // 듀얼 필터: 반씩 내려가고 (첫 단계는 문턱) 더하기 섞기로 올라온다
+        for (u32 i = 0; i < kBloomLevels; ++i) {
+            const f32 srcW = i ? static_cast<f32>(chain.bloomSize[i - 1][0]) : w, srcH = i ? static_cast<f32>(chain.bloomSize[i - 1][1]) : h;
+            const f32 dstW = static_cast<f32>(chain.bloomSize[i][0]), dstH = static_cast<f32>(chain.bloomSize[i][1]);
+            cmd.beginTarget(chain.bloom[i], nullptr, 0.0f);
+            cmd.setViewport(0.0f, 0.0f, dstW, dstH);
+            cmd.setPipeline(bloomDown);
+            push.source = i ? device.textureIndex(device.renderTargetTexture(chain.bloom[i - 1])) : sceneTexture;
+            push.first = i == 0;
+            push.texel[0] = 1.0f / srcW, push.texel[1] = 1.0f / srcH;
+            push.scale[0] = 1.0f / dstW, push.scale[1] = 1.0f / dstH;
+            cmd.pushConstants(&push, sizeof(push));
+            cmd.draw(3, 1);
+            cmd.endTarget(chain.bloom[i]);
+        }
+        push.first = 0;
+        for (u32 i = kBloomLevels - 1; i-- > 0;) {
+            const f32 dstW = static_cast<f32>(chain.bloomSize[i][0]), dstH = static_cast<f32>(chain.bloomSize[i][1]);
+            cmd.beginTarget(chain.bloom[i], nullptr, 0.0f);
+            cmd.setViewport(0.0f, 0.0f, dstW, dstH);
+            cmd.setPipeline(bloomUp);
+            push.source = device.textureIndex(device.renderTargetTexture(chain.bloom[i + 1]));
+            push.texel[0] = 1.0f / static_cast<f32>(chain.bloomSize[i + 1][0]), push.texel[1] = 1.0f / static_cast<f32>(chain.bloomSize[i + 1][1]);
+            push.scale[0] = 1.0f / dstW, push.scale[1] = 1.0f / dstH;
+            cmd.pushConstants(&push, sizeof(push));
+            cmd.draw(3, 1);
+            cmd.endTarget(chain.bloom[i]);
+        }
+        stats.drawCalls += kBloomLevels * 2 - 1;
+    }
+
+    if (output) {
+        cmd.beginTarget(output, nullptr, 0.0f);
+        cmd.setViewport(0.0f, 0.0f, w, h);
+    } else {
+        cmd.beginOverlay();
+        cmd.setViewport(rect[0], rect[1], rect[2], rect[3]);
+    }
+    cmd.setPipeline(uber);
+    push.source = sceneTexture;
+    push.texel[0] = 1.0f / w, push.texel[1] = 1.0f / h;
+    push.scale[0] = 1.0f / w, push.scale[1] = 1.0f / h;
+    cmd.pushConstants(&push, sizeof(push));
+    cmd.draw(3, 1);
+    stats.drawCalls += 1;
+    if (output) cmd.endTarget(output);
+    if (timed) endPass();
+}
+
+void Renderer::Impl::resolveScene() {
+    if (!sceneBound || sceneResolved) return;
+    sceneResolved = true;
+    device.cmd().endTarget(mainChain.scene);
+    PostParams post = sceneParams.post;
+    if (debugView != DebugView::None) post.toneMapping = false; // 보기 모드는 색을 그대로
+    runPost(mainChain, post, sceneViewport, {}, true, sceneParams.time);
+}
+
 rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {
     if (!m || width == 0 || height == 0) return {};
-    const rhi::RenderTarget target = m->device.createRenderTarget(width, height);
-    m->targetSizes.resize(target.id + 1);
-    m->targetSizes[target.id] = {width, height};
-    return target;
+    Impl::Offscreen o;
+    o.output = m->device.createRenderTarget(width, height, rhi::TargetKind::Ldr);
+    m->resizeChain(o.chain, width, height); // 짝 HDR 장면 대상
+    if (m->offscreen.size() <= o.output.id) m->offscreen.resize(o.output.id + 1);
+    m->offscreen[o.output.id] = o;
+    return o.output;
 }
 
 rhi::Texture Renderer::renderTargetTexture(rhi::RenderTarget target) const {
@@ -970,8 +1260,10 @@ rhi::Texture Renderer::renderTargetTexture(rhi::RenderTarget target) const {
 }
 
 void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, const DrawList& list, LightingModel lighting) {
-    if (!m || !m->inFrame || !target || target.id >= m->targetSizes.size()) return;
-    m->ensureScene(); // 본 화면이 아직 지워지지 않았으면 먼저 (이 뒤로 본 화면 3D는 그리지 않는다)
+    if (!m || !m->inFrame || !target || target.id >= m->offscreen.size() || m->offscreen[target.id].output.id != target.id) return;
+    m->ensureScene(); // 본 화면이 아직 지워지지 않았으면 먼저
+    m->resolveScene(); // 본 화면은 여기서 포스트를 거쳐 백버퍼로 (이 뒤로 본 화면 3D는 그리지 않는다)
+    Impl::PostChain& chain = m->offscreen[target.id].chain;
     rhi::CommandList& cmd = m->device.cmd();
     // 본 화면의 상태를 잠시 바꾼다: 프레임 상수·프러스텀·보기 모드 (오프스크린은 늘 조명 그림)
     const u64 frameOffset = m->frameOffset;
@@ -986,13 +1278,14 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
 
     const Vec3 sky = p.fogColor;
     const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
-    cmd.beginTarget(target, clear, 0.0f);
-    const auto [w, h] = m->targetSizes[target.id];
-    cmd.setViewport(0.0f, 0.0f, static_cast<f32>(w), static_cast<f32>(h));
+    cmd.beginTarget(chain.scene, clear, 0.0f);
+    const f32 rect[4] = {0.0f, 0.0f, static_cast<f32>(chain.width), static_cast<f32>(chain.height)};
+    cmd.setViewport(rect[0], rect[1], rect[2], rect[3]);
     m->drawSky(p);
     cmd.setPipeline(m->scenePipeline());
     list.submit(*this);
-    cmd.endTarget(target);
+    cmd.endTarget(chain.scene);
+    m->runPost(chain, p.post, rect, target, false, p.time);
 
     m->frameOffset = frameOffset;
     m->frustum = frustum;
@@ -1129,6 +1422,7 @@ void Renderer::drawParticles(const Particle* particles, u32 count) {
 void Renderer::beginOverlay() {
     if (!m || !m->inFrame) return;
     m->ensureScene();
+    m->resolveScene();
     m->device.cmd().beginOverlay();
     m->beginPass(GpuPass::Ui); // UI + 디버그 UI
 }
@@ -1154,6 +1448,7 @@ void Renderer::updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8
 void Renderer::drawUi(const UiQuad* quads, u32 count) {
     if (!m || !m->inFrame) return;
     m->ensureScene();
+    m->resolveScene();
     m->flushUploads(); // 복사는 그리기 대상을 푼다: 아래에서 오버레이를 다시 묶는다
     if (count == 0) return;
     const u64 bytes = static_cast<u64>(count) * sizeof(UiQuad);
@@ -1192,6 +1487,7 @@ u32 Renderer::height() const { return m ? m->device.height() : 0; }
 void Renderer::endFrame() {
     if (!m || !m->inFrame) return;
     m->ensureScene(); // 아무것도 그리지 않은 프레임도 지운다
+    m->resolveScene();
     m->endPass();
     if (m->captureOut) {
         rhi::Capture capture;
