@@ -5,17 +5,17 @@
 #include <algorithm>
 #include <cmath>
 
-// 프러스텀 컬링 (CPU, 바운딩 구). 렌더러가 프레임마다 viewProj에서 평면을 뽑고, DrawList::submit이 인스턴스마다 본다.
-// 화면에만 영향이 있고 시뮬레이션과 무관하다 (화면 쪽 float 수학, 결정론 규칙 밖).
+// Frustum culling (CPU, bounding spheres). The renderer extracts planes from viewProj every frame, and DrawList::submit checks each instance.
+// Affects only the view and is unrelated to the simulation (view-side float math, outside determinism rules).
 namespace mealkit::render {
 
-// 메시 로컬 공간의 바운딩 구 (메시를 만들 때 정점에서)
+// Bounding sphere in mesh local space (from vertices when the mesh is made)
 struct BoundingSphere {
     Vec3 center;
     f32 radius = 0.0f;
 };
 
-// 정점 상자의 가운데 + 가장 먼 정점까지의 거리 (최소 구는 아니지만 한 번에 구한다)
+// Center of the vertex box + distance to the farthest vertex (not a minimal sphere, but computed in one pass)
 inline BoundingSphere boundingSphere(const Vec3* points, size_t count) {
     if (count == 0) return {};
     Vec3 lo = points[0], hi = points[0];
@@ -31,12 +31,12 @@ inline BoundingSphere boundingSphere(const Vec3* points, size_t count) {
     return s;
 }
 
-// 평면 6개 (안쪽이 양수, 법선 길이 1). 법선이 없는 평면(무한히 먼 면)은 건너뛴다
+// 6 planes (positive inside, unit-length normals). Planes without a normal (infinitely far planes) are skipped
 struct Frustum {
     f32 planes[6][4] = {};
     u32 count = 0;
 
-    // 행 벡터 규약(clip = v * viewProj), 클립 공간 -w<=x,y<=w, 0<=z<=w (DX12·reversed-Z 모두)
+    // Row vector convention (clip = v * viewProj), clip space -w<=x,y<=w, 0<=z<=w (both DX12 and reversed-Z)
     static Frustum fromViewProj(const Mat4& vp) {
         Frustum f;
         const auto col = [&](int c, int row) { return vp.m[row][c]; };
@@ -55,7 +55,7 @@ struct Frustum {
         return f;
     }
 
-    // 월드 공간 구가 프러스텀과 겹친다 (경계에 걸치면 보이는 쪽)
+    // A world-space sphere overlaps the frustum (counts as visible when straddling the boundary)
     bool sphereVisible(Vec3 c, f32 r) const {
         for (u32 i = 0; i < count; ++i) {
             const f32* p = planes[i];

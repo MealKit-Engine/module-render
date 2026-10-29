@@ -36,7 +36,7 @@
 namespace mealkit::render {
 namespace {
 
-// shaders/Forward.hlsl FrameConstants와 같은 배치 (업로드 링에 쓰고 셰이더가 Load로 읽는다)
+// Same layout as FrameConstants in shaders/Forward.hlsl (written to the upload ring and read by the shader with Load)
 struct FrameConstants {
     f32 viewProj[16];
     f32 cameraPos[4];
@@ -46,23 +46,23 @@ struct FrameConstants {
     f32 groundColor[4];
     f32 fogColor[4];
     f32 screenTint[4];
-    u32 materials[4]; // 머티리얼 표의 링 위치, 개수, 0, 0
-    f32 wind[4];      // 수평 방향 x, z, 세기, 화면 시간
-    u32 style[4];     // 툰 램프 텍스처 (bindless), 0, 0, 0
-    f32 invViewProj[16]; // 스카이박스: 화면 → 월드 방향
-    u32 env[4];          // 하늘 큐브, 반사 큐브 (g_cubes 번호), 반사 밉 수, 있음(1)
-    f32 envParams[4];    // 세기, cos(회전), sin(회전), 0
-    f32 sh[9][4];        // 환경광 SH (rgb, 0)
-    u32 probes[4];       // 반사 프로브 표의 링 위치, 개수, 0, 0 (표: 프로브마다 위치 xyz, 큐브 번호 | 밉 수 << 24, 상자 반 크기 xyz, 0)
-    u32 lights[4];       // 점광원 표의 링 위치, 개수, 0, 0 (표: 빛마다 위치 xyz, 거리, 색 rgb, 0)
-    f32 shadowViewProj[kMaxShadowCascades][16]; // 단계마다 월드 → 그림자 클립 (행 우선)
-    f32 shadowForward[4]; // 카메라 앞 방향 xyz (단계 고르기: 앞 방향 거리), 0
-    f32 shadowSplits[4];  // 단계 0 끝 거리, 마지막 단계 끝 거리, 단계 0·1 텍셀의 월드 크기 (법선 밀기)
-    u32 shadow[4];        // 그림자 맵 텍스처 (bindless), 단계 수 (0 = 그림자 없음), 단계 하나 크기, 0
+    u32 materials[4]; // material table ring offset, count, 0, 0
+    f32 wind[4];      // horizontal direction x, z, strength, view time
+    u32 style[4];     // toon ramp texture (bindless), 0, 0, 0
+    f32 invViewProj[16]; // skybox: screen → world direction
+    u32 env[4];          // sky cube, reflection cube (g_cubes index), reflection mip count, present (1)
+    f32 envParams[4];    // intensity, cos(rotation), sin(rotation), 0
+    f32 sh[9][4];        // ambient SH (rgb, 0)
+    u32 probes[4];       // reflection probe table ring offset, count, 0, 0 (table: per probe position xyz, cube index | mip count << 24, box half size xyz, 0)
+    u32 lights[4];       // point light table ring offset, count, 0, 0 (table: per light position xyz, range, color rgb, 0)
+    f32 shadowViewProj[kMaxShadowCascades][16]; // per cascade world → shadow clip (row-major)
+    f32 shadowForward[4]; // camera forward direction xyz (cascade selection: forward distance), 0
+    f32 shadowSplits[4];  // cascade 0 end distance, last cascade end distance, world size of cascade 0/1 texels (normal offset)
+    u32 shadow[4];        // shadow map texture (bindless), cascade count (0 = no shadows), size of one cascade, 0
 };
 static_assert(sizeof(FrameConstants) == 672);
 
-// 4×4 역행렬 (행 우선, 행 벡터 규칙 그대로). 특이 행렬이면 단위 행렬
+// 4×4 inverse (row-major, row vector convention kept). Identity for singular matrices
 void invert(const f32 m[16], f32 out[16]) {
     f32 inv[16];
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
@@ -89,14 +89,14 @@ void invert(const f32 m[16], f32 out[16]) {
     for (int i = 0; i < 16; ++i) out[i] = inv[i] / det;
 }
 
-// shaders/Forward.hlsl Material (128바이트)
+// shaders/Forward.hlsl Material (128 bytes)
 struct MaterialGpu {
     f32 baseColor[4];
     f32 emissive[3];
     f32 alphaCutoff;
     f32 metallic, roughness, normalScale;
-    u32 features;    // kMaterial* 비트
-    u32 textures[4]; // baseColor, normal, metallicRoughness, emissive (bindless 번호, kNoTexture = 없음)
+    u32 features;    // kMaterial* bits
+    u32 textures[4]; // baseColor, normal, metallicRoughness, emissive (bindless indices, kNoTexture = none)
     f32 outlineColor[3];
     f32 outlineWidth;
     f32 rimColor[3];
@@ -108,12 +108,12 @@ struct MaterialGpu {
 };
 static_assert(sizeof(MaterialGpu) == 128);
 
-// 픽셀 셰이더 변형 (render::LightingModel 순서, CMakeLists의 mealkit_shader LIGHTING_MODEL=n)
+// Pixel shader variants (render::LightingModel order, mealkit_shader LIGHTING_MODEL=n in CMakeLists)
 const rhi::ShaderCode kLightingPS[kLightingModelCount] = {
     {g_ForwardPbrPS, sizeof(g_ForwardPbrPS)}, {g_ForwardToonPS, sizeof(g_ForwardToonPS)}, {g_ForwardUnlitPS, sizeof(g_ForwardUnlitPS)}};
 const char* const kLightingDefines[kLightingModelCount] = {"LIGHTING_MODEL=0", "LIGHTING_MODEL=1", "LIGHTING_MODEL=2"};
 
-// 툰 램프 텍스처 너비. 프로젝트 그림은 이 너비로 가장 가까운 픽셀을 골라 줄인다(늘린다): 단계 경계가 흐려지지 않는다
+// Toon ramp texture width. Project images are resampled (down or up) to this width with nearest pixels: step edges don't blur
 constexpr u32 kToonRampWidth = 256;
 
 struct ForwardPush {
@@ -121,8 +121,8 @@ struct ForwardPush {
     u32 frameOffset = 0;
     u32 instanceOffset = 0;
     u32 debugView = 0;   // render::DebugView (Forward.hlsl PSMain)
-    u32 lightOffset = 0; // 인스턴스마다 점광원 번호 8개(8바이트, 0xFF = 끝)의 링 위치 (프레임에 빛이 있을 때만 읽는다)
-    u32 paletteOffset = 0; // 스킨 메시: 팔레트(관절마다 48바이트)의 링 위치
+    u32 lightOffset = 0; // ring offset of 8 point light indices per instance (8 bytes, 0xFF = end) (read only when the frame has lights)
+    u32 paletteOffset = 0; // skinned meshes: ring offset of the palette (48 bytes per joint)
     u32 pad[2] = {};
 };
 
@@ -135,7 +135,7 @@ struct UiPush {
     u32 pad[2] = {};
 };
 
-// shaders/Post.hlsl PostPush (48바이트)
+// shaders/Post.hlsl PostPush (48 bytes)
 struct PostPush {
     u32 ring = 0;
     u32 constOffset = 0;
@@ -146,26 +146,26 @@ struct PostPush {
     f32 scale[2] = {};
 };
 
-// shaders/Post.hlsl PostConstants (업로드 링, 96바이트)
+// shaders/Post.hlsl PostConstants (upload ring, 96 bytes)
 struct PostConstants {
-    f32 exposure[4]; // 노출 배율, 블룸 세기, 비네트 세기, 비네트 부드러움
-    f32 effects[4];  // 그레인, 색수차, 시간, 샤프닝
-    u32 textures[4]; // 블룸 사슬 맨 위, LUT, 플래그, 0 (없음 = kNoTexture)
-    f32 bloom[4];    // 블룸 색, 문턱
-    f32 region[4];   // 장면 영역 uv
+    f32 exposure[4]; // exposure scale, bloom strength, vignette strength, vignette softness
+    f32 effects[4];  // grain, chromatic aberration, time, sharpening
+    u32 textures[4]; // top of the bloom chain, LUT, flags, 0 (none = kNoTexture)
+    f32 bloom[4];    // bloom color, threshold
+    f32 region[4];   // scene region uv
     f32 sceneSize[4];
 };
 static_assert(sizeof(PostConstants) == 96);
 constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u, kPostSharpen = 8u; // Post.hlsl kPost*
-constexpr u32 kLutWidth = kLutSize * kLutSize; // 32³을 가로 띠 1024 × 32로 (파랑 조각마다 32칸)
+constexpr u32 kLutWidth = kLutSize * kLutSize; // 32³ as a horizontal strip 1024 × 32 (32 cells per blue slice)
 
-// 색맹 보정 (Fidaner 계열 daltonize): 선형 RGB에서 Machado 2009(심한 정도 1.0)로 그 사람이 보는 색을 흉내 내고,
-// 못 보는 차이를 볼 수 있는 채널로 옮긴다. 입력·출력은 0..1 sRGB 값 (LUT 칸)
+// Color blindness correction (Fidaner-style daltonize): simulates the colors that person sees from linear RGB with Machado 2009 (severity 1.0),
+// and moves the differences they can't see into channels they can. Input and output are 0..1 sRGB values (LUT cells)
 void daltonize(ColorBlindMode mode, f32 c[3]) {
     static const f32 kSimulate[3][9] = {
-        {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},  // 1형 (빨강)
-        {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},   // 2형 (초록)
-        {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f}}; // 3형 (파랑)
+        {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},  // protanopia (red)
+        {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},   // deuteranopia (green)
+        {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f}}; // tritanopia (blue)
     if (mode == ColorBlindMode::Off) return;
     const f32* s = kSimulate[static_cast<u32>(mode) - 1];
     f32 lin[3];
@@ -186,11 +186,11 @@ struct GpuMesh {
     rhi::Buffer indexBuffer;
     u32 indexCount = 0;
     BoundingSphere bounds;
-    bool outline = false; // 외곽선 머티리얼이 하나라도 있다: 외곽선 패스로 한 번 더 그린다
-    bool skinned = false; // 정점 44바이트 (Vertex + SkinWeights), 스킨 파이프라인으로 그린다
+    bool outline = false; // at least one outline material: drawn once more with the outline pass
+    bool skinned = false; // 44-byte vertices (Vertex + SkinWeights), drawn with the skin pipeline
 };
 
-// 스킨 파이프라인: 같은 desc에 정점 셰이더(SKINNED=1)와 관절 속성 둘, 정점 간격 44바이트
+// Skin pipeline: the same desc with the vertex shader (SKINNED=1) and two joint attributes, 44-byte vertex stride
 rhi::PipelineDesc skinnedDesc(rhi::PipelineDesc d, rhi::ShaderCode vs) {
     d.vs = vs;
     d.vertexAttributes.push_back({"JOINTS", rhi::VertexFormat::Uint8x4, sizeof(Vertex)});
@@ -203,41 +203,41 @@ rhi::PipelineDesc skinnedDesc(rhi::PipelineDesc d, rhi::ShaderCode vs) {
 
 struct Renderer::Impl {
     rhi::Device device;
-    rhi::Pipeline forward[kLightingModelCount]; // 조명 모델마다 (init이 모두 만든다: 바꿔도 끊기지 않는다)
-    rhi::Pipeline outline;                      // 외곽선 패스 (뒤집은 껍질)
-    // 스킨 메시 변형 (정점 셰이더만 다르다: SKINNED=1). 보기 모드 둘은 디버그 UI 빌드만
+    rhi::Pipeline forward[kLightingModelCount]; // one per lighting model (init builds all: switching doesn't hitch)
+    rhi::Pipeline outline;                      // outline pass (inverted hull)
+    // Skinned mesh variants (only the vertex shader differs: SKINNED=1). The two view modes only in debug UI builds
     rhi::Pipeline forwardSkin[kLightingModelCount], outlineSkin, shadowSkin, wireSkin, overdrawSkin;
     rhi::PipelineDesc forwardSkinDesc[kLightingModelCount], outlineSkinDesc, shadowSkinDesc;
-    rhi::Pipeline forwardWire, forwardOverdraw; // 에디터 보기 모드 (디버그 UI 빌드만, PBR 셰이더)
+    rhi::Pipeline forwardWire, forwardOverdraw; // editor view modes (debug UI builds only, PBR shader)
     rhi::Pipeline ui;
-    rhi::Pipeline particles; // shaders/Particle.hlsl (불투명 3D 다음, 깊이 쓰기 없음)
+    rhi::Pipeline particles; // shaders/Particle.hlsl (after opaque 3D, no depth writes)
     rhi::PipelineDesc particleDesc;
-    rhi::Pipeline sky; // 스카이박스 (화면 가득 삼각형, 깊이 없이 3D 전에)
+    rhi::Pipeline sky; // skybox (fullscreen triangle, before 3D without depth)
     rhi::PipelineDesc skyDesc;
     struct Environment {
-        u32 sky = 0, reflect = 0, reflectMips = 0; // g_cubes 번호
+        u32 sky = 0, reflect = 0, reflectMips = 0; // g_cubes indices
         f32 sh[9][3] = {};
     };
-    std::vector<Environment> environments; // createEnvironment 번호 - 1
-    std::vector<u32> probes;               // createProbe 번호 - 1 → 큐브 번호 | 밉 수 << 24
-    std::vector<PointLight> frameLights;   // 이번 프레임 상수에 쓴 점광원 (drawInstances가 인스턴스마다 고른다)
+    std::vector<Environment> environments; // createEnvironment index - 1
+    std::vector<u32> probes;               // createProbe index - 1 → cube index | mip count << 24
+    std::vector<PointLight> frameLights;   // point lights written to this frame's constants (drawInstances picks per instance)
     u32 lightsPerObject = 4;
-    std::vector<u8> lightPicks;            // drawInstances 작업 버퍼
+    std::vector<u8> lightPicks;            // drawInstances work buffer
 
-    // 태양 그림자: 단계들을 가로로 붙인 깊이 아틀라스 하나 (단계 i는 x = i × size)
+    // Sun shadows: one depth atlas with the cascades side by side (cascade i at x = i × size)
     ShadowSettings shadowSettings;
     rhi::RenderTarget shadowTarget;
     u32 shadowTargetSize = 0, shadowTargetCascades = 0;
     rhi::Pipeline shadowPipeline;
     rhi::PipelineDesc shadowDesc;
-    u32 shadowCascades = 0;                    // 이번 프레임 (0 = 그리지 않는다)
+    u32 shadowCascades = 0;                    // this frame (0 = not drawn)
     Mat4 shadowViewProj[kMaxShadowCascades];
-    u64 shadowFrameOffsets[kMaxShadowCascades] = {}; // 단계마다 viewProj만 바꾼 프레임 상수
-    bool shadowPending = false;                // 이번 프레임 그림자 맵을 아직 그리지 않았다
+    u64 shadowFrameOffsets[kMaxShadowCascades] = {}; // per cascade, frame constants with only viewProj changed
+    bool shadowPending = false;                // this frame's shadow map hasn't been drawn yet
     void computeCascades(const FrameParams& p, FrameConstants& fc);
 
-    // 포스트 프로세싱 (shaders/Post.hlsl): HDR 장면 대상 + 블룸 사슬(절반부터 반씩, 처음 쓸 때 만든다).
-    // 본 화면은 창 크기(beginFrame이 맞춘다), 오프스크린은 출력 대상(Ldr)마다 같은 크기의 짝
+    // Post-processing (shaders/Post.hlsl): HDR scene target + bloom chain (halving from half res, created on first use).
+    // The main view is window size (beginFrame matches it); offscreen has a pair of the same size per output target (Ldr)
     static constexpr u32 kBloomLevels = 5;
     struct PostChain {
         rhi::RenderTarget scene;
@@ -247,56 +247,56 @@ struct Renderer::Impl {
     };
     PostChain mainChain;
     struct Offscreen {
-        rhi::RenderTarget output; // createRenderTarget이 준 Ldr 대상 (0 = 이 번호는 다른 대상)
+        rhi::RenderTarget output; // Ldr target given by createRenderTarget (0 = this index is another target)
         PostChain chain;
     };
-    std::vector<Offscreen> offscreen; // RenderTarget::id로
+    std::vector<Offscreen> offscreen; // by RenderTarget::id
     rhi::Pipeline bloomDown, bloomUp, uber;
     rhi::PipelineDesc bloomDownDesc, bloomUpDesc, uberDesc;
     PostOptions postOptions;
     struct Lut {
-        std::vector<f32> rgb; // kLutSize³ × 3 (색맹 보정을 바꾸면 다시 합친다)
+        std::vector<f32> rgb; // kLutSize³ × 3 (recombined when color blindness correction changes)
         rhi::Texture texture; // kLutWidth × kLutSize RGBA8
     };
-    std::vector<Lut> luts; // 0 = 항등 (색맹 보정만 할 때)
+    std::vector<Lut> luts; // 0 = identity (for color blindness correction only)
     void uploadLut(u32 index);
-    void resizeChain(PostChain& chain, u32 width, u32 height); // 프레임 밖에서 (옛 대상은 지운다)
+    void resizeChain(PostChain& chain, u32 width, u32 height); // outside a frame (old targets are deleted)
     void ensureBloom(PostChain& chain);
-    // 장면 대상(chain.scene, endTarget까지 끝난)을 output(없으면 백버퍼의 rect 영역)으로. timed: GPU 패스 Post로 잰다
-    // scale: 장면은 rect × scale 영역에 있다 (동적 해상도, 우버 패스가 rect로 늘린다)
+    // Scene target (chain.scene, finished through endTarget) to output (or the rect area of the back buffer if none). timed: measured as GPU pass Post
+    // scale: the scene is in the rect × scale area (dynamic resolution; the uber pass stretches it to rect)
     void runPost(PostChain& chain, const PostParams& post, const f32 rect[4], rhi::RenderTarget output, bool timed, f32 time,
                  f32 scale = 1.0f);
-    // 동적 해상도 (본 화면만): beginFrame이 GPU 시간으로 배율을 고른다
+    // Dynamic resolution (main view only): beginFrame picks the scale from GPU time
     ResolutionSettings resolution;
-    f32 renderScale = 1.0f;  // 조절기가 고른 배율
-    f32 sceneScale = 1.0f;   // 이번 프레임 (보기 모드는 1)
-    f32 gpuAverage = 0.0f;   // GPU 프레임 시간 지수 평균
-    u32 scaleCooldown = 0;   // 배율을 바꾼 뒤 기다릴 프레임 (GPU 시간은 kFramesInFlight 늦다)
+    f32 renderScale = 1.0f;  // scale chosen by the controller
+    f32 sceneScale = 1.0f;   // this frame (1 for view modes)
+    f32 gpuAverage = 0.0f;   // exponential average of GPU frame time
+    u32 scaleCooldown = 0;   // frames to wait after changing the scale (GPU time lags by kFramesInFlight)
     void updateResolution();
-    bool sceneResolved = false; // 본 화면을 포스트로 백버퍼에 냈다 (이 뒤로 본 화면 3D 없음)
-    void resolveScene();        // ensureScene 다음에
+    bool sceneResolved = false; // the main view was sent to the back buffer via post (no main view 3D after this)
+    void resolveScene();        // after ensureScene
 
-    // 본 화면 3D 대상은 처음 그릴 때 묶는다 (그림자 패스가 먼저 다른 대상에 그릴 수 있게)
+    // The main view 3D target is bound on first draw (so the shadow pass can draw to another target first)
     bool sceneBound = false;
     f32 sceneClear[4] = {};
     f32 sceneViewport[4] = {};
     bool sceneSky = false;
-    FrameParams sceneParams; // drawSky가 보는 환경 (포인터 필드는 쓰지 않는다)
+    FrameParams sceneParams; // environment seen by drawSky (pointer fields aren't used)
     void ensureScene();
-    rhi::RenderTarget captureSource;       // captureTarget (이번 endFrame)
+    rhi::RenderTarget captureSource;       // captureTarget (this endFrame)
     Image* captureOut = nullptr;
-    void drawSky(const FrameParams& p); // 프레임 상수를 쓴 뒤, 3D 전에 (환경이 없으면 아무것도 하지 않는다)
+    void drawSky(const FrameParams& p); // after writing frame constants, before 3D (does nothing without an environment)
     LightingModel lighting = LightingModel::Pbr;
     DebugView debugView = DebugView::None;
-    // 셰이더 핫 리로드가 바이트코드만 바꿔 다시 만든다. forwardDesc[n]의 VS는 모두 같다
+    // Shader hot reload swaps only the bytecode and rebuilds. The VS of every forwardDesc[n] is the same
     rhi::PipelineDesc forwardDesc[kLightingModelCount], outlineDesc, uiDesc;
     ShaderReloader shaderReload;
     std::vector<GpuMesh> meshes;
-    std::vector<MaterialGpu> materials; // 0 = 기본 흰색. 프레임마다 업로드 링에 쓴다
+    std::vector<MaterialGpu> materials; // 0 = default white. Written to the upload ring every frame
     std::vector<rhi::Texture> textures;
-    rhi::Texture toonRamp; // kToonRampWidth × 1, setToonRamp가 내용을 바꾼다
+    rhi::Texture toonRamp; // kToonRampWidth × 1, contents changed by setToonRamp
 
-    // 2D UI (shaders/Ui.hlsl): 글자 SDF 아틀라스 + 이미지 아틀라스
+    // 2D UI (shaders/Ui.hlsl): glyph SDF atlas + image atlas
     rhi::Texture uiAtlas[2];
     struct TextureUpload {
         rhi::Texture texture;
@@ -304,18 +304,18 @@ struct Renderer::Impl {
         u32 x, y, w, h;
         std::vector<u8> pixels;
     };
-    std::vector<TextureUpload> uploads; // 아직 GPU에 올리지 않은 영역 (UI 아틀라스, 툰 램프. 차례대로)
+    std::vector<TextureUpload> uploads; // regions not yet uploaded to the GPU (UI atlases, toon ramp. In order)
 
-    u64 frameOffset = 0; // 이번 프레임 FrameConstants의 링 위치
-    u64 materialOffset = 0; // 이번 프레임 머티리얼 표의 링 위치 (본 화면과 오프스크린이 같이)
-    // 업로드 링에 쓰고 위치를 offset에. withShadows: 본 화면 (태양 그림자 단계를 정해 넣는다)
+    u64 frameOffset = 0; // ring offset of this frame's FrameConstants
+    u64 materialOffset = 0; // ring offset of this frame's material table (shared by main view and offscreen)
+    // Writes to the upload ring and puts the position in offset. withShadows: main view (decides and fills sun shadow cascades)
     void writeFrameConstants(const FrameParams& p, u64* offset, bool withShadows);
     bool vsync = true;
     bool inFrame = false;
     bool uploadOverflowWarned = false;
     RenderStats stats;
     Frustum frustum;
-    i32 openPass = -1; // 지금 GPU 시간을 재는 패스 (GpuPass, 없으면 -1)
+    i32 openPass = -1; // pass whose GPU time is being measured now (GpuPass, -1 if none)
     std::string capturePath;
 
     rhi::PipelineDesc wireDesc() const {
@@ -332,7 +332,7 @@ struct Renderer::Impl {
         return d;
     }
 
-    // 보기 모드 파이프라인 (와이어·오버드로): PBR 셰이더(forwardDesc[0])에서 만든다. 스킨 변형은 스킨 정점 셰이더로
+    // View mode pipelines (wire/overdraw): built from the PBR shader (forwardDesc[0]). Skin variants use the skin vertex shader
     void recreateViewModePipelines() {
 #if MEALKIT_DEBUG_UI
         device.recreatePipeline(forwardWire, wireDesc());
@@ -342,11 +342,11 @@ struct Renderer::Impl {
 #endif
     }
 
-    // 셰이더 핫 리로드 (개발 빌드: engine/shaders가 바뀌면 다시 컴파일해 바꿔 끼운다, 출시 빌드와 엔진 폴더가 없는 PC에서는
-    // 아무것도 하지 않는다). 파이프라인 하나에 한 줄: desc에 새 바이트코드를 넣어 두고(바이트코드는 ShaderReloader가 갖고 있다)
-    // 다시 만든다. PBR 변형(일반·스킨)이 바뀌면 거기서 나온 보기 모드 파이프라인도 같이
+    // Shader hot reload (dev builds: recompiles and swaps when engine/shaders changes; does nothing in shipping builds and on PCs
+    // without the engine folder). One line per pipeline: put the new bytecode into the desc (the ShaderReloader holds the bytecode)
+    // and rebuild. When a PBR variant (normal/skinned) changes, the view mode pipelines derived from it are rebuilt too
     void addShaderReloads() {
-        // 정의 두 개는 한 줄로: "-D"를 사이에 둔다
+        // Two defines on one line: "-D" between them
         static const char* const kSkinDefines[kLightingModelCount] = {"LIGHTING_MODEL=0 -D SKINNED=1", "LIGHTING_MODEL=1 -D SKINNED=1",
                                                                       "LIGHTING_MODEL=2 -D SKINNED=1"};
         struct Reload {
@@ -390,7 +390,7 @@ struct Renderer::Impl {
         }
     }
 
-    // 기다리던 아틀라스 영역을 이번 프레임 업로드 링으로 복사한다 (자리가 없으면 다음 프레임에)
+    // Copies pending atlas regions into this frame's upload ring (next frame if there's no room)
     void beginPass(GpuPass pass) {
         endPass();
         openPass = static_cast<i32>(pass);
@@ -429,7 +429,7 @@ struct Renderer::Impl {
         return debugView == DebugView::Wireframe ? forwardWire
                : debugView == DebugView::Overdraw ? forwardOverdraw
                : debugView == DebugView::None     ? forward[static_cast<u32>(lighting)]
-                                                  : forward[0]; // 보기 모드는 조명과 무관한 색 (PBR 셰이더 안)
+                                                  : forward[0]; // view modes use colors independent of lighting (inside the PBR shader)
     }
     void drawMesh(MeshId meshId, const InstanceData* instances, u32 count, u32 paletteOffset); // drawInstances·drawSkinned
 
@@ -448,7 +448,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->vsync = desc.vsync;
     if (!m->device.init({desc.window, desc.width, desc.height, desc.debugLayer, desc.gpuCapture})) return false;
 
-    // 스타일 프리셋: 조명 모델 셋 + 외곽선 파이프라인을 여기서 모두 만든다 (불러오는 중 한 번, 플레이 중 처음 보는 조합이 없다)
+    // Style presets: all three lighting models + the outline pipeline are built here (once during loading, so no unseen combination appears during play)
     rhi::PipelineDesc forward;
     forward.vs = {g_ForwardVS, sizeof(g_ForwardVS)};
     forward.vertexAttributes = {{"POSITION", rhi::VertexFormat::Float3, 0},
@@ -466,7 +466,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->outlineDesc = forward;
     m->outlineDesc.vs = {g_OutlineVS, sizeof(g_OutlineVS)};
     m->outlineDesc.ps = {g_OutlinePS, sizeof(g_OutlinePS)};
-    m->outlineDesc.cullFront = true; // 부푼 껍질의 뒷면만: 앞의 물체를 가리지 않고 둘레에 테두리로 남는다
+    m->outlineDesc.cullFront = true; // only the back faces of the inflated hull: doesn't cover the object in front, remains as a rim around it
     m->outline = m->device.createPipeline(m->outlineDesc);
 #if MEALKIT_DEBUG_UI
     m->forwardWire = m->device.createPipeline(m->wireDesc());
@@ -478,7 +478,7 @@ bool Renderer::init(const RendererDesc& desc) {
     ui.ps = {g_UiPS, sizeof(g_UiPS)};
     ui.target = rhi::Target::Overlay;
     ui.cullBack = false;
-    ui.premultipliedBlend = true; // 미리 곱한 알파
+    ui.premultipliedBlend = true; // premultiplied alpha
     m->ui = m->device.createPipeline(ui);
     m->uiDesc = ui;
     rhi::PipelineDesc sky;
@@ -486,14 +486,14 @@ bool Renderer::init(const RendererDesc& desc) {
     sky.ps = {g_SkyPS, sizeof(g_SkyPS)};
     sky.target = rhi::Target::Scene;
     sky.cullBack = false;
-    sky.depthTest = false; // 먼저 그리고 3D가 덮는다 (깊이도 쓰지 않는다)
+    sky.depthTest = false; // drawn first and covered by 3D (no depth writes either)
     m->skyDesc = sky;
     m->sky = m->device.createPipeline(sky);
-    rhi::PipelineDesc shadow = forward; // 그림자: 같은 정점 형식, 깊이만 (알파 마스크·디졸브만 픽셀 셰이더에서 버린다)
+    rhi::PipelineDesc shadow = forward; // shadows: same vertex format, depth only (only alpha mask/dissolve discard in the pixel shader)
     shadow.vs = {g_ShadowVS, sizeof(g_ShadowVS)};
     shadow.ps = {g_ShadowPS, sizeof(g_ShadowPS)};
     shadow.target = rhi::Target::Shadow;
-    shadow.cullBack = false; // 양면: 얇은 물체와 열린 모델도 그림자가 빈틈없다 (빛 새는 것은 법선 밀기가 막는다)
+    shadow.cullBack = false; // double-sided: thin objects and open models cast shadows without gaps (normal offset prevents light leaks)
     m->shadowDesc = shadow;
     m->shadowPipeline = m->device.createPipeline(shadow);
     const rhi::ShaderCode skinVS{g_ForwardSkinVS, sizeof(g_ForwardSkinVS)};
@@ -514,11 +514,11 @@ bool Renderer::init(const RendererDesc& desc) {
     particles.ps = {g_ParticlePS, sizeof(g_ParticlePS)};
     particles.target = rhi::Target::Scene;
     particles.cullBack = false;
-    particles.premultipliedBlend = true; // 더하기 파티클은 알파 0으로 낸다
+    particles.premultipliedBlend = true; // additive particles output alpha 0
     particles.depthWrite = false;
     m->particleDesc = particles;
     m->particles = m->device.createPipeline(particles);
-    // 포스트: 화면 가득 삼각형 (정점 버퍼·깊이 없음). 블룸 사슬은 HDR, 우버 패스는 백버퍼·Ldr 대상
+    // Post: fullscreen triangle (no vertex buffer/depth). The bloom chain is HDR, the uber pass targets the back buffer/Ldr targets
     rhi::PipelineDesc post;
     post.vs = {g_PostVS, sizeof(g_PostVS)};
     post.cullBack = false;
@@ -528,7 +528,7 @@ bool Renderer::init(const RendererDesc& desc) {
     m->bloomDownDesc.ps = {g_BloomDownPS, sizeof(g_BloomDownPS)};
     m->bloomUpDesc = post;
     m->bloomUpDesc.ps = {g_BloomUpPS, sizeof(g_BloomUpPS)};
-    m->bloomUpDesc.additiveBlend = true; // 그 단계의 내려온 값 위에 쌓는다
+    m->bloomUpDesc.additiveBlend = true; // stacks on top of the value that came down at that step
     m->uberDesc = post;
     m->uberDesc.ps = {g_UberPS, sizeof(g_UberPS)};
     m->uberDesc.target = rhi::Target::Overlay;
@@ -537,14 +537,14 @@ bool Renderer::init(const RendererDesc& desc) {
     m->uber = m->device.createPipeline(m->uberDesc);
     m->addShaderReloads();
 
-    createMaterial({}); // 0번: 기본 흰색 (머티리얼 없는 메시, 상자)
+    createMaterial({}); // index 0: default white (meshes without material, boxes)
     std::vector<f32> identity(static_cast<size_t>(kLutSize) * kLutSize * kLutSize * 3);
     for (u32 i = 0; i < kLutSize * kLutSize * kLutSize; ++i) {
         identity[i * 3 + 0] = static_cast<f32>(i % kLutSize) / (kLutSize - 1);
         identity[i * 3 + 1] = static_cast<f32>(i / kLutSize % kLutSize) / (kLutSize - 1);
         identity[i * 3 + 2] = static_cast<f32>(i / (kLutSize * kLutSize)) / (kLutSize - 1);
     }
-    createLut(identity.data()); // 0번: 항등 (색맹 보정만 할 때)
+    createLut(identity.data()); // index 0: identity (for color blindness correction only)
     m->uiAtlas[0] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::R8Unorm);
     m->uiAtlas[1] = m->device.createTexture(kUiAtlasSize, kUiAtlasSize, rhi::Format::Rgba8Unorm);
     m->toonRamp = m->device.createTexture(kToonRampWidth, 1, rhi::Format::Rgba8Unorm);
@@ -587,10 +587,10 @@ void Renderer::setToonRamp(const Image* ramp) {
     for (u32 x = 0; x < kToonRampWidth; ++x) {
         u8* px = &u.pixels[x * 4];
         if (ramp && ramp->width && ramp->rgba.size() >= static_cast<size_t>(ramp->width) * 4) {
-            const u32 sx = std::min(ramp->width - 1, x * ramp->width / kToonRampWidth); // 첫 줄, 가장 가까운 픽셀
+            const u32 sx = std::min(ramp->width - 1, x * ramp->width / kToonRampWidth); // first row, nearest pixel
             std::memcpy(px, &ramp->rgba[sx * 4], 4);
         } else {
-            // 엔진 기본 3단계 (sRGB, 셰이더가 제곱해 선형 0.35 / 0.72 / 1.0): 그늘 → 중간 → 밝은 면
+            // Engine default 3 steps (sRGB; the shader squares them to linear 0.35 / 0.72 / 1.0): shade → mid → lit
             const f32 t = (static_cast<f32>(x) + 0.5f) / static_cast<f32>(kToonRampWidth);
             const u8 v = t < 0.42f ? 151 : t < 0.6f ? 216 : 255;
             px[0] = px[1] = px[2] = v;
@@ -629,7 +629,7 @@ u32 Renderer::createMaterial(const MaterialData& d) {
     std::memcpy(g.dissolveColor, d.dissolveColor, sizeof(g.dissolveColor));
     g.dissolveEdge = d.dissolveEdge;
     g.windStrength = d.windStrength;
-    if (m->materials.size() >= 0xFFFF) { // 정점의 material은 16비트
+    if (m->materials.size() >= 0xFFFF) { // vertex material is 16-bit
         MEALKIT_WARN("createMaterial: too many materials, using the default");
         return 0;
     }
@@ -650,7 +650,7 @@ MeshId Renderer::createMesh(const MeshData& data) {
     }
     GpuMesh mesh;
     mesh.skinned = data.skin.size() == data.vertices.size();
-    if (mesh.skinned) { // Vertex 뒤에 SkinWeights를 붙인 44바이트 정점
+    if (mesh.skinned) { // 44-byte vertices with SkinWeights appended after Vertex
         std::vector<u8> interleaved(data.vertices.size() * kSkinnedVertexStride);
         for (size_t i = 0; i < data.vertices.size(); ++i) {
             std::memcpy(&interleaved[i * kSkinnedVertexStride], &data.vertices[i], sizeof(Vertex));
@@ -661,7 +661,7 @@ MeshId Renderer::createMesh(const MeshData& data) {
         mesh.vertexBuffer =
             m->device.createBuffer(rhi::BufferUsage::Vertex, data.vertices.data(), data.vertices.size() * sizeof(Vertex));
     }
-    // 정점이 적으면 16비트 인덱스로 줄여 메모리 대역폭을 아낀다 (내장 그래픽에서 중요)
+    // With few vertices, shrink to 16-bit indices to save memory bandwidth (important on integrated graphics)
     if (data.vertices.size() <= 0xFFFF) {
         const std::vector<u16> shortIndices(data.indices.begin(), data.indices.end());
         mesh.indexBuffer = m->device.createBuffer(rhi::BufferUsage::Index16, shortIndices.data(),
@@ -684,17 +684,17 @@ MeshId Renderer::createMesh(const MeshData& data) {
 }
 
 bool Renderer::beginFrame(const FrameParams& p) {
-    if (m) m->shaderReload.update(); // 프레임 밖에서 (파이프라인을 바꿀 때 GPU를 기다린다)
+    if (m) m->shaderReload.update(); // outside a frame (waits for the GPU when swapping pipelines)
     if (m && width() && height() && (m->mainChain.width != width() || m->mainChain.height != height()))
-        m->resizeChain(m->mainChain, width(), height()); // HDR 장면 대상은 창 크기 (지우기는 프레임 밖에서)
+        m->resizeChain(m->mainChain, width(), height()); // the HDR scene target is window size (deletion happens outside a frame)
     if (!m || !m->mainChain.scene || !m->device.beginFrame()) return false;
     rhi::CommandList& cmd = m->device.cmd();
 
-    const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // 배경도 번쩍임을 받는다
+    const Vec3 sky = lerp(p.fogColor, p.tintColor, std::clamp(p.tintAmount, 0.0f, 1.0f)); // the background gets the flash too
     m->debugView = supportsDebugView(p.debugView) ? p.debugView : DebugView::None;
     const bool overdraw = m->debugView == DebugView::Overdraw;
     const f32 clear[4] = {overdraw ? 0.0f : sky.x, overdraw ? 0.0f : sky.y, overdraw ? 0.0f : sky.z, 1.0f};
-    m->flushUploads(); // 툰 램프·UI 아틀라스 (복사는 그리기 대상을 묶기 전에)
+    m->flushUploads(); // toon ramp/UI atlases (copies happen before binding draw targets)
     std::memcpy(m->sceneClear, clear, sizeof(clear));
 
     const f32 fullW = static_cast<f32>(width()), fullH = static_cast<f32>(height());
@@ -716,8 +716,8 @@ bool Renderer::beginFrame(const FrameParams& p) {
     if (u8* mat = m->device.allocUpload(materialBytes, kRingAlignment, &m->materialOffset)) std::memcpy(mat, m->materials.data(), materialBytes);
     else m->warnOverflow(materialBytes);
     m->shadowCascades = 0;
-    m->writeFrameConstants(p, &m->frameOffset, true); // 그림자 단계도 정한다 (shadowCascades)
-    if (m->shadowCascades) { // 단계마다 viewProj만 바꾼 프레임 상수 (그림자 패스의 정점 셰이더)
+    m->writeFrameConstants(p, &m->frameOffset, true); // also decides shadow cascades (shadowCascades)
+    if (m->shadowCascades) { // per cascade, frame constants with only viewProj changed (vertex shader of the shadow pass)
         FrameParams sp = p;
         sp.lights = nullptr;
         sp.lightCount = 0;
@@ -752,17 +752,17 @@ bool Renderer::beginFrame(const FrameParams& p) {
 void Renderer::Impl::ensureScene() {
     if (sceneBound) return;
     sceneBound = true;
-    shadowPending = false; // 본 화면을 묶은 뒤에는 그림자 맵을 그리지 않는다 (이번 프레임은 비었거나 그린 것)
+    shadowPending = false; // no shadow map drawing after binding the main view (this frame's is empty or already drawn)
     rhi::CommandList& cmd = device.cmd();
     beginPass(GpuPass::Opaque);
-    cmd.beginTarget(mainChain.scene, sceneClear, 0.0f); // HDR 장면 대상, reversed-Z: 먼 쪽이 0
+    cmd.beginTarget(mainChain.scene, sceneClear, 0.0f); // HDR scene target, reversed-Z: far is 0
     cmd.setViewport(sceneViewport[0] * sceneScale, sceneViewport[1] * sceneScale, std::max(1.0f, sceneViewport[2] * sceneScale),
                     std::max(1.0f, sceneViewport[3] * sceneScale));
     if (sceneSky) drawSky(sceneParams);
     cmd.setPipeline(scenePipeline());
 }
 
-// 4×4 행렬로 점 하나 (행 벡터 규칙, w로 나눈다)
+// One point through a 4×4 matrix (row vector convention, divided by w)
 static Vec3 transformPoint(const f32 m[16], Vec3 v) {
     const f32 x = v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12];
     const f32 y = v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13];
@@ -771,8 +771,8 @@ static Vec3 transformPoint(const f32 m[16], Vec3 v) {
     return Vec3{x, y, z} * (1.0f / w);
 }
 
-// 단계 나누기 (docs/DECISIONS.md 2026-10-27 그림자): 카메라 조각마다 감싸는 구 → 빛 방향 정사영. 구 반지름과 중심을 텍셀 단위로
-// 맞춰 카메라가 돌거나 움직여도 그림자 가장자리가 떨리지 않는다. 빛 쪽으로 100 m를 더 잡아 화면 밖 물체의 그림자도 받는다
+// Cascade splitting (docs/DECISIONS.md 2026-10-27 shadows): a bounding sphere per camera slice → orthographic along the light. The sphere radius and center are snapped
+// to texels so shadow edges don't shimmer when the camera rotates or moves. 100 m more toward the light so off-screen objects' shadows are received too
 void Renderer::Impl::computeCascades(const FrameParams& p, FrameConstants& fc) {
     const ShadowSettings& s = shadowSettings;
     if (!s.enabled || debugView != DebugView::None || !shadowPipeline) return;
@@ -785,17 +785,17 @@ void Renderer::Impl::computeCascades(const FrameParams& p, FrameConstants& fc) {
     f32 inv[16];
     invert(&p.viewProj.m[0][0], inv);
     const Vec3 eye = p.cameraPos;
-    const Vec3 ahead = normalize(transformPoint(inv, {0.0f, 0.0f, 1.0f}) - eye); // 가까운 면 가운데 (reversed-Z)
+    const Vec3 ahead = normalize(transformPoint(inv, {0.0f, 0.0f, 1.0f}) - eye); // center of the near plane (reversed-Z)
     Vec3 rays[4];
     const f32 corners[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
     for (u32 i = 0; i < 4; ++i) {
         const Vec3 d = normalize(transformPoint(inv, {corners[i][0], corners[i][1], 1.0f}) - eye);
-        rays[i] = d * (1.0f / std::max(dot(d, ahead), 1e-3f)); // 앞 방향 거리 1당 이동
+        rays[i] = d * (1.0f / std::max(dot(d, ahead), 1e-3f)); // movement per unit of forward distance
     }
     const f32 splits[kMaxShadowCascades + 1] = {0.0f, cascades == 1 ? s.distance : s.distance * 0.25f, s.distance};
     const Vec3 toSun = normalize(p.sunDirection);
     const Vec3 up = std::abs(toSun.y) > 0.99f ? Vec3{0, 0, 1} : Vec3{0, 1, 0};
-    const Mat4 lightView = lookAtLH({}, toSun * -1.0f, up); // 원점에서 빛 방향을 본다 (위치는 정사영 상자가 정한다)
+    const Mat4 lightView = lookAtLH({}, toSun * -1.0f, up); // looks along the light direction from the origin (position decided by the ortho box)
     for (u32 c = 0; c < cascades; ++c) {
         Vec3 points[8];
         for (u32 i = 0; i < 4; ++i) {
@@ -812,7 +812,7 @@ void Renderer::Impl::computeCascades(const FrameParams& p, FrameConstants& fc) {
         c0.x = std::floor(c0.x / texel) * texel;
         c0.y = std::floor(c0.y / texel) * texel;
         const f32 zNear = c0.z - radius - 100.0f, zFar = c0.z + radius;
-        Mat4 ortho; // 정사영 (reversed-Z: 가까운 면 1, 먼 면 0)
+        Mat4 ortho; // orthographic (reversed-Z: near plane 1, far plane 0)
         ortho.m[0][0] = 1.0f / radius;
         ortho.m[1][1] = 1.0f / radius;
         ortho.m[2][2] = -1.0f / (zFar - zNear);
@@ -868,7 +868,7 @@ void Renderer::drawShadows(const DrawList& list) {
             }
             std::memcpy(cpu, visible.data(), bytes);
             const GpuMesh& gm = m->meshes[mesh];
-            if (gm.skinned) continue; // 스킨 메시는 아래에서 팔레트와 함께
+            if (gm.skinned) continue; // skinned meshes below together with palettes
             const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(offset), 0, 0};
             cmd.pushConstants(&push, sizeof(push));
             cmd.setVertexBuffer(gm.vertexBuffer, sizeof(Vertex));
@@ -876,7 +876,7 @@ void Renderer::drawShadows(const DrawList& list) {
             cmd.drawIndexed(gm.indexCount, static_cast<u32>(visible.size()));
             m->stats.drawCalls += 1;
         }
-        // 스킨 메시: 캐릭터마다 팔레트를 올리고 하나씩
+        // Skinned meshes: upload the palette per character, one at a time
         bool skinBound = false;
         for (const DrawList::SkinnedItem& item : list.skinned()) {
             if (item.mesh >= m->meshes.size() || !m->meshes[item.mesh].skinned) continue;
@@ -1093,8 +1093,8 @@ void Renderer::Impl::resizeChain(PostChain& chain, u32 width, u32 height) {
     chain.height = height;
 }
 
-// 동적 해상도 조절기: GPU 시간은 2프레임 늦어 평균을 내고, 바꾼 뒤 몇 프레임은 그 결과를 기다린다.
-// 넘으면 시간이 배율² (픽셀 수)에 비례한다고 보고 한 번에 맞추고, 여유가 크면 조금씩 올린다 (오르내림 반복을 막는 띠 75~95%)
+// Dynamic resolution controller: GPU time lags 2 frames so it's averaged, and after a change it waits a few frames for the result.
+// When over, assumes time is proportional to scale² (pixel count) and corrects in one step; with plenty of headroom it raises slowly (a 75~95% band prevents oscillation)
 void Renderer::Impl::updateResolution() {
     const ResolutionSettings& r = resolution;
     const f32 top = std::clamp(r.maxScale, 0.25f, 1.0f), bottom = std::clamp(std::min(r.minScale, top), 0.25f, 1.0f);
@@ -1113,7 +1113,7 @@ void Renderer::Impl::updateResolution() {
     f32 next = renderScale;
     if (gpuAverage > r.budgetMs * 0.95f) next = renderScale * std::sqrt(r.budgetMs * 0.85f / gpuAverage);
     else if (gpuAverage < r.budgetMs * 0.75f) next = renderScale + 0.02f;
-    next = std::clamp(std::round(next * 64.0f) / 64.0f, bottom, top); // 1/64 단위 (작은 떨림은 버린다)
+    next = std::clamp(std::round(next * 64.0f) / 64.0f, bottom, top); // in 1/64 steps (small jitter is dropped)
     if (next != renderScale) {
         renderScale = next;
         gpuAverage = 0.0f;
@@ -1152,14 +1152,14 @@ void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32
     rhi::CommandList& cmd = device.cmd();
     if (timed) beginPass(GpuPass::Post);
     const f32 w = static_cast<f32>(chain.width), h = static_cast<f32>(chain.height);
-    // 장면 영역 uv (줄인 영역). 우버 패스는 출력 픽셀 × scale / 크기로 읽는다
+    // Scene region uv (reduced area). The uber pass reads output pixels × scale / size
     const f32 region[4] = {rect[0] * scale / w, rect[1] * scale / h, (rect[0] + std::max(1.0f, rect[2] * scale)) / w,
                            (rect[1] + std::max(1.0f, rect[3] * scale)) / h};
     const bool sharpen = scale < 0.999f && resolution.sharpness > 0.0f;
     const bool tone = post.toneMapping;
     const bool bloom = tone && postOptions.bloom && post.bloomIntensity > 0.0f;
     const u32 lut = post.lut < luts.size() ? post.lut : 0;
-    if (bloom) ensureBloom(chain); // 처음 쓸 때 (만들기는 프레임 안에서도 된다: 그림자 맵과 같다)
+    if (bloom) ensureBloom(chain); // on first use (creation is fine inside a frame too: same as shadow maps)
     const bool bloomReady = bloom && chain.bloom[0];
 
     PostConstants pc{};
@@ -1196,7 +1196,7 @@ void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32
     std::memcpy(push.rect, region, sizeof(region));
     const u32 sceneTexture = device.textureIndex(device.renderTargetTexture(chain.scene));
 
-    if (bloomReady) { // 듀얼 필터: 반씩 내려가고 (첫 단계는 문턱) 더하기 섞기로 올라온다
+    if (bloomReady) { // dual filter: halve going down (the first step thresholds) and come back up with additive blend
         for (u32 i = 0; i < kBloomLevels; ++i) {
             const f32 srcW = i ? static_cast<f32>(chain.bloomSize[i - 1][0]) : w, srcH = i ? static_cast<f32>(chain.bloomSize[i - 1][1]) : h;
             const f32 dstW = static_cast<f32>(chain.bloomSize[i][0]), dstH = static_cast<f32>(chain.bloomSize[i][1]);
@@ -1250,7 +1250,7 @@ void Renderer::Impl::resolveScene() {
     sceneResolved = true;
     device.cmd().endTarget(mainChain.scene);
     PostParams post = sceneParams.post;
-    if (debugView != DebugView::None) post.toneMapping = false; // 보기 모드는 색을 그대로
+    if (debugView != DebugView::None) post.toneMapping = false; // view modes keep colors as is
     runPost(mainChain, post, sceneViewport, {}, true, sceneParams.time, sceneScale);
 }
 
@@ -1258,7 +1258,7 @@ rhi::RenderTarget Renderer::createRenderTarget(u32 width, u32 height) {
     if (!m || width == 0 || height == 0) return {};
     Impl::Offscreen o;
     o.output = m->device.createRenderTarget(width, height, rhi::TargetKind::Ldr);
-    m->resizeChain(o.chain, width, height); // 짝 HDR 장면 대상
+    m->resizeChain(o.chain, width, height); // paired HDR scene target
     if (m->offscreen.size() <= o.output.id) m->offscreen.resize(o.output.id + 1);
     m->offscreen[o.output.id] = o;
     return o.output;
@@ -1270,11 +1270,11 @@ rhi::Texture Renderer::renderTargetTexture(rhi::RenderTarget target) const {
 
 void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, const DrawList& list, LightingModel lighting) {
     if (!m || !m->inFrame || !target || target.id >= m->offscreen.size() || m->offscreen[target.id].output.id != target.id) return;
-    m->ensureScene(); // 본 화면이 아직 지워지지 않았으면 먼저
-    m->resolveScene(); // 본 화면은 여기서 포스트를 거쳐 백버퍼로 (이 뒤로 본 화면 3D는 그리지 않는다)
+    m->ensureScene(); // first, if the main view hasn't been cleared yet
+    m->resolveScene(); // the main view goes through post to the back buffer here (no main view 3D after this)
     Impl::PostChain& chain = m->offscreen[target.id].chain;
     rhi::CommandList& cmd = m->device.cmd();
-    // 본 화면의 상태를 잠시 바꾼다: 프레임 상수·프러스텀·보기 모드 (오프스크린은 늘 조명 그림)
+    // Temporarily changes the main view state: frame constants, frustum, view mode (offscreen is always the lit image)
     const u64 frameOffset = m->frameOffset;
     const Frustum frustum = m->frustum;
     const DebugView debugView = m->debugView;
@@ -1282,7 +1282,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     std::vector<PointLight> frameLights = m->frameLights;
     m->debugView = DebugView::None;
     m->lighting = lighting;
-    m->writeFrameConstants(p, &m->frameOffset, false); // 오프스크린은 그림자 없이 (룩데브, 반사 프로브 굽기)
+    m->writeFrameConstants(p, &m->frameOffset, false); // offscreen without shadows (lookdev, reflection probe baking)
     m->frustum = Frustum::fromViewProj(p.viewProj);
 
     const Vec3 sky = p.fogColor;
@@ -1306,7 +1306,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
 void Renderer::drawInstances(MeshId meshId, const InstanceData* instances, u32 count) {
     if (!m || !m->inFrame || count == 0 || meshId >= m->meshes.size()) return;
     m->ensureScene();
-    if (m->meshes[meshId].skinned) { // 팔레트 없이 add한 스킨 메시: 바인드 자세 (단위 팔레트)
+    if (m->meshes[meshId].skinned) { // a skinned mesh added without a palette: bind pose (identity palette)
         static const std::vector<BoneMatrix> identity(64, BoneMatrix{{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}});
         for (u32 i = 0; i < count; ++i) drawSkinned(meshId, instances[i], identity.data(), 64);
         return;
@@ -1341,9 +1341,9 @@ void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 
     std::memcpy(cpu, instances, bytes);
 
     const GpuMesh& mesh = meshes[meshId];
-    const f32 boundsScale = mesh.skinned ? DrawList::kSkinnedBoundsScale : 1.0f; // 빛 고르기 (애니메이션 여유)
+    const f32 boundsScale = mesh.skinned ? DrawList::kSkinnedBoundsScale : 1.0f; // light selection (animation margin)
     u64 lightOffset = 0;
-    if (!frameLights.empty()) { // 점광원: 인스턴스마다 영향이 큰 빛을 고른다 (바운딩 구와 닿는 빛, 중심에서의 밝기 순)
+    if (!frameLights.empty()) { // point lights: pick the most influential lights per instance (lights touching the bounding sphere, by brightness at the center)
         lightPicks.assign(static_cast<size_t>(count) * kMaxLightsPerObject, 0xFF);
         struct Pick {
             f32 score;
@@ -1362,10 +1362,10 @@ void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 
                 const Vec3 d = light.position - center;
                 const f32 dist = std::sqrt(dot(d, d));
                 if (dist > light.range + radius) continue;
-                const f32 near = std::max(dist - radius, 0.0f); // 물체에서 가장 가까운 점
+                const f32 near = std::max(dist - radius, 0.0f); // the point closest to the object
                 const f32 score = (light.color.x + light.color.y + light.color.z) * (1.0f - near / light.range) / (near * near + 1.0f);
                 u32 at = picked < lightsPerObject ? picked++ : lightsPerObject;
-                if (at == lightsPerObject) { // 가득 찼다: 가장 약한 것보다 세면 바꾼다
+                if (at == lightsPerObject) { // full: replace the weakest if this one is stronger
                     u32 weakest = 0;
                     for (u32 k = 1; k < picked; ++k)
                         if (best[k].score < best[weakest].score) weakest = k;
@@ -1394,7 +1394,7 @@ void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 
     cmd.drawIndexed(mesh.indexCount, count);
     stats.drawCalls += 1;
     stats.instances += count;
-    if (mesh.outline && debugView == DebugView::None) { // 외곽선: 같은 인스턴스를 껍질 패스로 한 번 더
+    if (mesh.outline && debugView == DebugView::None) { // outline: the same instances once more with the hull pass
         cmd.setPipeline(mesh.skinned ? outlineSkin : outline);
         cmd.pushConstants(&push, sizeof(push));
         cmd.drawIndexed(mesh.indexCount, count);
@@ -1418,14 +1418,14 @@ void Renderer::drawParticles(const Particle* particles, u32 count) {
     }
     std::memcpy(cpu, particles, bytes);
     rhi::CommandList& cmd = m->device.cmd();
-    const bool vfxPass = m->openPass == static_cast<i32>(GpuPass::Opaque); // 오프스크린(룩데브)은 따로 재지 않는다
+    const bool vfxPass = m->openPass == static_cast<i32>(GpuPass::Opaque); // offscreen (lookdev) isn't measured separately
     if (vfxPass) m->beginPass(GpuPass::Vfx);
     cmd.setPipeline(m->particles);
     const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset), 0, 0};
     cmd.pushConstants(&push, sizeof(push));
     cmd.draw(6, count);
-    cmd.setPipeline(m->scenePipeline()); // 뒤에 더 그리는 3D가 있으면 (drawToTarget 등)
-    m->stats.drawCalls += 1; // Vfx 구간은 beginOverlay(UI)까지 (파티클은 DrawList::submit의 마지막)
+    cmd.setPipeline(m->scenePipeline()); // if more 3D is drawn after (drawToTarget etc.)
+    m->stats.drawCalls += 1; // the Vfx section lasts until beginOverlay (UI) (particles are last in DrawList::submit)
 }
 
 void Renderer::beginOverlay() {
@@ -1433,13 +1433,13 @@ void Renderer::beginOverlay() {
     m->ensureScene();
     m->resolveScene();
     m->device.cmd().beginOverlay();
-    m->beginPass(GpuPass::Ui); // UI + 디버그 UI
+    m->beginPass(GpuPass::Ui); // UI + debug UI
 }
 
 void Renderer::updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels) {
     if (!m || w == 0 || h == 0 || x + w > kUiAtlasSize || y + h > kUiAtlasSize) return;
     const u32 bpp = atlas == UiAtlas::Glyphs ? 1u : 4u;
-    // 큰 영역은 줄 묶음으로 나눈다 (프레임 업로드 링에 들어가게)
+    // Large regions are split into row batches (so they fit in the frame upload ring)
     const u32 rowsPerPiece = std::max(1u, static_cast<u32>((1u << 20) / (w * bpp)));
     for (u32 row = 0; row < h; row += rowsPerPiece) {
         Impl::TextureUpload u;
@@ -1458,7 +1458,7 @@ void Renderer::drawUi(const UiQuad* quads, u32 count) {
     if (!m || !m->inFrame) return;
     m->ensureScene();
     m->resolveScene();
-    m->flushUploads(); // 복사는 그리기 대상을 푼다: 아래에서 오버레이를 다시 묶는다
+    m->flushUploads(); // copies unbind the draw target: the overlay is rebound below
     if (count == 0) return;
     const u64 bytes = static_cast<u64>(count) * sizeof(UiQuad);
     u64 offset = 0;
@@ -1495,7 +1495,7 @@ u32 Renderer::height() const { return m ? m->device.height() : 0; }
 
 void Renderer::endFrame() {
     if (!m || !m->inFrame) return;
-    m->ensureScene(); // 아무것도 그리지 않은 프레임도 지운다
+    m->ensureScene(); // clears even frames where nothing was drawn
     m->resolveScene();
     m->endPass();
     if (m->captureOut) {
@@ -1550,7 +1550,7 @@ BoundingSphere Renderer::meshBounds(MeshId mesh) const {
     return m && mesh < m->meshes.size() ? m->meshes[mesh].bounds : BoundingSphere{};
 }
 const Frustum& Renderer::frustum() const {
-    static const Frustum none; // 평면이 없으면 모두 보인다
+    static const Frustum none; // with no planes everything is visible
     return m ? m->frustum : none;
 }
 void Renderer::addCulled(u32 count) {
@@ -1562,7 +1562,7 @@ bool Renderer::supportsDebugView(DebugView view) const {
 #if MEALKIT_DEBUG_UI
     return true;
 #else
-    return false; // 출시 빌드: 보기 모드 파이프라인이 없다
+    return false; // shipping builds: no view mode pipelines
 #endif
 }
 rhi::GpuMemory Renderer::gpuMemory() const { return m ? m->device.gpuMemory() : rhi::GpuMemory{}; }

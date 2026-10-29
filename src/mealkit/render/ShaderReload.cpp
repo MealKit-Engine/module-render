@@ -15,8 +15,8 @@ namespace mealkit::render {
 #if MEALKIT_SHADER_HOT_RELOAD
 
 namespace {
-constexpr f64 kCheckSeconds = 0.5;         // 파일 시각을 보는 간격
-const char* const kProfiles[2] = {"vs_6_6", "ps_6_6"}; // CMakeLists의 mealkit_shader와 같다
+constexpr f64 kCheckSeconds = 0.5;         // interval for checking file times
+const char* const kProfiles[2] = {"vs_6_6", "ps_6_6"}; // same as mealkit_shader in CMakeLists
 } // namespace
 
 struct ShaderReloader::Impl {
@@ -35,7 +35,7 @@ struct ShaderReloader::Impl {
     unsigned long long includeTime = 0;
     f64 nextCheck = 0.0;
 
-    std::deque<size_t> queue; // 다시 컴파일할 프로그램
+    std::deque<size_t> queue; // programs to recompile
     ChildProcess process;
     std::string output;
     size_t job = 0;
@@ -43,16 +43,16 @@ struct ShaderReloader::Impl {
     bool busy = false;
 
     std::string source(const std::string& file) const { return sourceDir + "/" + file; }
-    // 같은 파일의 변형(조명 모델)마다 다른 파일 이름
+    // A different file name per variant (lighting model) of the same file
     std::string binary(size_t program, u32 s) const {
         return outDir + "/" + programs[program].file + "." + std::to_string(program) + "." + programs[program].entries[s] + ".bin";
     }
 
     void startStage() {
-        // ChildProcess가 cmd.exe /s /c "..."로 감싼다
+        // ChildProcess wraps it in cmd.exe /s /c "..."
         const Program& p = programs[job];
         const std::string define = p.defines.empty() ? std::string() : " -D " + p.defines;
-        // SPIR-V(Vulkan 빌드)는 진입점 이름을 VSMain·PSMain으로 (CMakeLists의 mealkit_shader와 같게)
+        // SPIR-V (Vulkan builds) renames entry points to VSMain/PSMain (same as mealkit_shader in CMakeLists)
         const std::string flags = MEALKIT_SHADER_HOT_FLAGS;
         const std::string entryName =
             flags.find("-spirv") != std::string::npos ? std::string(" -fspv-entrypoint-name=") + (stage == 0 ? "VSMain" : "PSMain") : "";
@@ -105,9 +105,9 @@ void ShaderReloader::add(const char* file, Apply apply, const char* vsEntry, con
 void ShaderReloader::update() {
     if (!m->enabled) return;
     if (m->busy) {
-        if (m->process.poll(m->output)) return; // 아직 컴파일 중
+        if (m->process.poll(m->output)) return; // still compiling
         m->busy = false;
-        if (m->process.exitCode() != 0) { // 오류: 로그에 남기고 이전 셰이더를 계속 쓴다
+        if (m->process.exitCode() != 0) { // error: log it and keep using the previous shader
             MEALKIT_ERROR("Shader reload: %s (%s) failed, keeping the old shader\n%s", m->programs[m->job].file.c_str(),
                           m->programs[m->job].entries[m->stage].c_str(), m->output.c_str());
         } else if (m->stage == 0) {
@@ -130,7 +130,7 @@ void ShaderReloader::update() {
     if (now < m->nextCheck) return;
     m->nextCheck = now + kCheckSeconds;
     const unsigned long long include = fileWriteTime(m->source("Bindless.hlsli"));
-    const bool all = include != m->includeTime; // 공통 헤더가 바뀌면 모두
+    const bool all = include != m->includeTime; // all when the common header changes
     m->includeTime = include;
     for (size_t i = 0; i < m->programs.size(); ++i) {
         const unsigned long long t = fileWriteTime(m->source(m->programs[i].file));
@@ -139,7 +139,7 @@ void ShaderReloader::update() {
     }
 }
 
-#else // 출시 빌드: 아무것도 하지 않는다
+#else // shipping builds: do nothing
 
 struct ShaderReloader::Impl {};
 ShaderReloader::ShaderReloader() = default;

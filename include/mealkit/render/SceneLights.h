@@ -5,8 +5,8 @@
 
 #include <vector>
 
-// 씬의 점광원 물체(scene::kTypePointLight) → render::PointLight (월드 좌표, 계층·펼친 씬 모두).
-// 에디터와 게임 화면이 같이 쓴다. out에 더한다(화면 쪽 효과의 잠깐 빛은 그 뒤에 더한다)
+// Scene point light objects (scene::kTypePointLight) → render::PointLight (world coordinates, both hierarchical and flattened scenes).
+// Shared by the editor and the game view. Appends to out (brief lights from view-side effects are added after)
 namespace mealkit::render {
 
 inline Vec3 srgbToLinear(Color c) {

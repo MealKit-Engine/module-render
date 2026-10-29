@@ -8,9 +8,9 @@
 
 namespace mealkit::render {
 
-// 한 프레임에 그릴 인스턴스를 메시별로 모은다. submit()하면 메시마다 드로우 콜 1회.
-// submit은 renderer.beginFrame 뒤에 부르고, 그 프레임 프러스텀 밖의 인스턴스(메시 바운딩 구 기준)는 GPU에 올리지 않는다.
-// 버킷 메모리는 프레임 사이에 재사용된다.
+// Gathers instances to draw in one frame per mesh. submit() issues one draw call per mesh.
+// Call submit after renderer.beginFrame; instances outside that frame's frustum (by mesh bounding sphere) aren't uploaded to the GPU.
+// Bucket memory is reused between frames.
 class DrawList {
 public:
     void clear() {
@@ -20,11 +20,11 @@ public:
         m_particles.clear();
     }
 
-    // 파티클 (feedback::Player::addParticles): 불투명 3D 다음 한 번에 그린다
+    // Particles (feedback::Player::addParticles): drawn all at once after opaque 3D
     void addParticles(const Particle* particles, size_t count) { m_particles.insert(m_particles.end(), particles, particles + count); }
     const std::vector<Particle>& particles() const { return m_particles; }
 
-    // 스킨 메시 (캐릭터): 팔레트를 복사해 둔다 (asset::skinPalette). 메시마다 묶지 않고 하나씩 그린다
+    // Skinned meshes (characters): the palette is copied (asset::skinPalette). Drawn one at a time, not batched per mesh
     void addSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount) {
         m_skinned.push_back({mesh, instance, static_cast<u32>(m_bones.size()), boneCount});
         m_bones.insert(m_bones.end(), bones, bones + boneCount);
@@ -36,7 +36,7 @@ public:
     };
     const std::vector<SkinnedItem>& skinned() const { return m_skinned; }
     const BoneMatrix* bones(const SkinnedItem& item) const { return m_bones.data() + item.firstBone; }
-    // 스킨 메시의 컬링 구: 바인드 자세 경계를 애니메이션 여유만큼 키운다
+    // Culling sphere for skinned meshes: the bind pose bounds enlarged by an animation margin
     static constexpr f32 kSkinnedBoundsScale = 1.5f;
 
     void add(MeshId mesh, const InstanceData& instance) {
@@ -45,7 +45,7 @@ public:
     }
 
     void submit(Renderer& renderer) const {
-        renderer.drawShadows(*this); // 그림자 맵 먼저 (본 화면을 묶기 전에)
+        renderer.drawShadows(*this); // shadow maps first (before binding the main view)
         const Frustum& frustum = renderer.frustum();
         for (size_t mesh = 0; mesh < m_buckets.size(); ++mesh) {
             const auto& bucket = m_buckets[mesh];
@@ -76,7 +76,7 @@ public:
         if (!m_particles.empty()) renderer.drawParticles(m_particles.data(), static_cast<u32>(m_particles.size()));
     }
 
-    // 메시 번호 = 칸 번호 (그림자 패스가 읽는다)
+    // Mesh index = bucket index (read by the shadow pass)
     const std::vector<std::vector<InstanceData>>& buckets() const { return m_buckets; }
 
 private:
@@ -84,7 +84,7 @@ private:
     std::vector<SkinnedItem> m_skinned;
     std::vector<BoneMatrix> m_bones;
     std::vector<Particle> m_particles;
-    mutable std::vector<InstanceData> m_visible; // submit의 작업 버퍼 (프레임 사이에 재사용)
+    mutable std::vector<InstanceData> m_visible; // submit's work buffer (reused between frames)
 };
 
 } // namespace mealkit::render

@@ -17,77 +17,77 @@ namespace mealkit::render {
 class DrawList;
 using MeshId = u32;
 
-// 머티리얼 (glTF PBR metallic-roughness의 지원 범위, docs/CODING_MODEL.md "모델·머티리얼·텍스처"). 렌더러가 표로 갖고
-// 프레임마다 업로드 링에 쓴다 (shaders/Forward.hlsl Material, 64바이트). 텍스처는 bindless 번호 (kNoTexture = 없음)
+// Materials (supported range of glTF PBR metallic-roughness, docs/CODING_MODEL.md "Models, materials, textures"). The renderer keeps them in a table
+// and writes it to the upload ring every frame (shaders/Forward.hlsl Material, 64 bytes). Textures are bindless indices (kNoTexture = none)
 inline constexpr u32 kNoTexture = 0xFFFFFFFFu;
 
-// 조명 모델 (스타일 프리셋, docs/CODING_MODEL.md "셰이더 코드"): 프로젝트 설정 lightingModel 하나가 게임 전체를 정한다.
-// 셰이더는 모델마다 하나씩 빌드 때 컴파일되고, 렌더러가 init에서 파이프라인을 모두 만든다 (바꿔도 끊기지 않는다)
-enum class LightingModel : u8 { Pbr, Toon, Unlit }; // 프로젝트 설정 game::LightingModelSetting과 같은 순서
+// Lighting model (style preset, docs/CODING_MODEL.md "Shader code"): the single project setting lightingModel decides it for the whole game.
+// One shader per model is compiled at build time, and the renderer builds all pipelines in init (switching doesn't hitch)
+enum class LightingModel : u8 { Pbr, Toon, Unlit }; // same order as the project setting game::LightingModelSetting
 inline constexpr u32 kLightingModelCount = 3;
 
-// 머티리얼 기능 (glTF extras "mealkit_<키>", asset::modelSchemaJson의 materialFeatures). 셰이더 변형이 아니라
-// 머티리얼 표의 비트로 셰이더 안에서 고른다: 한 메시에 기능이 다른 머티리얼이 섞여도 드로우 콜 1회 그대로
-inline constexpr u32 kMaterialOutline = 1u;  // 외곽선: 뒤집은 껍질 패스 (메시에 하나라도 있으면 그 메시를 한 번 더 그린다)
-inline constexpr u32 kMaterialWind = 2u;     // 바람 흔들림: 세기는 정점 색 알파로 칠한다 (알파 없는 모델은 1)
-inline constexpr u32 kMaterialRim = 4u;      // 림 라이트: 가장자리가 밝아진다
-inline constexpr u32 kMaterialDissolve = 8u; // 디졸브: 인스턴스의 디졸브 진행도(instanceDissolve)만큼 사라진다
+// Material features (glTF extras "mealkit_<key>", materialFeatures in asset::modelSchemaJson). Not shader variants but
+// chosen inside the shader by material table bits: even if materials with different features mix in one mesh, it's still one draw call
+inline constexpr u32 kMaterialOutline = 1u;  // outline: inverted hull pass (if any material in a mesh has it, that mesh is drawn once more)
+inline constexpr u32 kMaterialWind = 2u;     // wind sway: strength is painted in vertex color alpha (1 for models without alpha)
+inline constexpr u32 kMaterialRim = 4u;      // rim light: edges get brighter
+inline constexpr u32 kMaterialDissolve = 8u; // dissolve: disappears by the instance's dissolve progress (instanceDissolve)
 
 struct MaterialData {
-    f32 baseColor[4] = {1, 1, 1, 1}; // 선형
+    f32 baseColor[4] = {1, 1, 1, 1}; // linear
     f32 emissive[3] = {0, 0, 0};
     f32 metallic = 0.0f;
     f32 roughness = 1.0f;
     f32 normalScale = 1.0f;
-    f32 alphaCutoff = 0.0f; // > 0이면 알파 마스크 (이보다 작은 알파는 그리지 않는다)
+    f32 alphaCutoff = 0.0f; // > 0 means alpha mask (alpha below this isn't drawn)
     u32 baseColorTexture = kNoTexture;
     u32 normalTexture = kNoTexture;
-    u32 metallicRoughnessTexture = kNoTexture; // G = 거칠기, B = 금속 (glTF)
+    u32 metallicRoughnessTexture = kNoTexture; // G = roughness, B = metal (glTF)
     u32 emissiveTexture = kNoTexture;
-    // 스타일 프리셋 머티리얼 기능 (kMaterial* 비트와 값). 색은 선형
+    // Style preset material features (kMaterial* bits and values). Colors are linear
     u32 features = 0;
-    f32 outlineWidth = 0.02f; // 미터 (월드 단위, 인스턴스 크기와 무관)
+    f32 outlineWidth = 0.02f; // meters (world units, independent of instance scale)
     f32 outlineColor[3] = {0, 0, 0};
-    f32 windStrength = 0.1f;  // 미터 (정점 알파 1, FrameParams::windStrength 1일 때 흔들리는 폭)
+    f32 windStrength = 0.1f;  // meters (sway amplitude at vertex alpha 1 and FrameParams::windStrength 1)
     f32 rimStrength = 0.5f;
     f32 rimColor[3] = {1, 1, 1};
-    f32 dissolveEdge = 0.05f; // 사라지는 경계의 빛나는 폭 (진행도 단위 0..1)
-    f32 dissolveColor[3] = {4.0f, 1.6f, 0.4f}; // 경계 발광 (선형, 1보다 크면 더 밝다)
+    f32 dissolveEdge = 0.05f; // glowing width of the disappearing edge (in progress units 0..1)
+    f32 dissolveColor[3] = {4.0f, 1.6f, 0.4f}; // edge emission (linear, brighter above 1)
 };
 
-// GPU로 그대로 복사되는 인스턴스 데이터 (HLSL Instance 구조체와 동일한 48바이트).
+// Instance data copied to the GPU as is (48 bytes, identical to the HLSL Instance struct).
 struct InstanceData {
     Vec3 position;
-    u32 color = 0xFFFFFFFF; // rgba() 로 만든 sRGB 색
+    u32 color = 0xFFFFFFFF; // sRGB color made with rgba()
     Quat rotation;
     Vec3 scale{1, 1, 1};
     u32 flags = 0;
 };
 static_assert(sizeof(InstanceData) == 48, "InstanceData must match the HLSL layout");
 
-inline constexpr u32 kInstanceChecker = 1u;   // 바닥용 체커 패턴
-inline constexpr u32 kInstanceHighlight = 2u; // 에디터 선택 강조
-inline constexpr u32 kInstanceOverBudget = 4u; // 에디터 보기 모드 Budget: 에셋 예산을 넘은 모델
-inline constexpr u32 kInstanceLodShift = 8;    // 에디터 보기 모드 Lod: 비트 8~9 = 그린 LOD 단계
-// 인스턴스마다 바뀌는 스타일 값 (flags 위 16비트, 인스턴스는 48바이트 그대로): view/가 틱 이벤트로 바꾼다
-inline constexpr u32 kInstanceFlashShift = 16;    // 비트 16~23: 번쩍임 0..1 (흰색으로 섞는다, 모든 머티리얼)
-inline constexpr u32 kInstanceDissolveShift = 24; // 비트 24~31: 디졸브 진행도 0..1 (kMaterialDissolve 머티리얼만)
+inline constexpr u32 kInstanceChecker = 1u;   // checker pattern for floors
+inline constexpr u32 kInstanceHighlight = 2u; // editor selection highlight
+inline constexpr u32 kInstanceOverBudget = 4u; // editor view mode Budget: models over the asset budget
+inline constexpr u32 kInstanceLodShift = 8;    // editor view mode Lod: bits 8~9 = drawn LOD level
+// Per-instance style values (upper 16 bits of flags, the instance stays 48 bytes): changed by view/ from tick events
+inline constexpr u32 kInstanceFlashShift = 16;    // bits 16~23: flash 0..1 (blended toward white, all materials)
+inline constexpr u32 kInstanceDissolveShift = 24; // bits 24~31: dissolve progress 0..1 (kMaterialDissolve materials only)
 inline u32 instanceUnit8(f32 amount) { return static_cast<u32>((amount < 0.0f ? 0.0f : amount > 1.0f ? 1.0f : amount) * 255.0f + 0.5f); }
-// flags에 번쩍임을 넣는다: out.add(mesh, {..., instanceFlash(flags, 0.8f)})
+// Puts a flash into flags: out.add(mesh, {..., instanceFlash(flags, 0.8f)})
 inline u32 instanceFlash(u32 flags, f32 amount) { return (flags & ~(0xFFu << kInstanceFlashShift)) | (instanceUnit8(amount) << kInstanceFlashShift); }
 inline u32 instanceDissolve(u32 flags, f32 progress) {
     return (flags & ~(0xFFu << kInstanceDissolveShift)) | (instanceUnit8(progress) << kInstanceDissolveShift);
 }
 
-// 에디터 보기 모드 (씬 뷰에서 무엇이 비싼지 색으로). 디버그 UI가 있는 빌드에만 파이프라인이 있고, 출시 빌드는 None만
+// Editor view modes (what's expensive in the scene view, by color). Pipelines exist only in builds with debug UI; shipping builds have only None
 enum class DebugView : u8 {
     None,
-    Wireframe, // 삼각형 선
-    Normals,   // 법선 방향 = 색
-    Lod,       // LOD 0 초록, 1 노랑, 2 빨강
-    Overdraw,  // 같은 픽셀을 그린 횟수 = 밝기 (깊이 시험 없이 더하기)
-    Budget,    // 예산을 넘은 모델 빨강, 나머지 회색
-    Features,  // 머티리얼 기능: 외곽선 빨강, 바람 초록, 림 파랑, 디졸브 노랑 (섞이면 더한 색), 없음 회색
+    Wireframe, // triangle lines
+    Normals,   // normal direction = color
+    Lod,       // LOD 0 green, 1 yellow, 2 red
+    Overdraw,  // number of times the same pixel was drawn = brightness (additive without depth test)
+    Budget,    // models over budget red, the rest gray
+    Features,  // material features: outline red, wind green, rim blue, dissolve yellow (summed when combined), none gray
     Count
 };
 
@@ -95,132 +95,132 @@ constexpr u32 rgba(u8 r, u8 g, u8 b, u8 a = 255) {
     return static_cast<u32>(r) | (static_cast<u32>(g) << 8) | (static_cast<u32>(b) << 16) | (static_cast<u32>(a) << 24);
 }
 
-// 파티클 하나 (HLSL Particle과 같은 32바이트, shaders/Particle.hlsl). 카메라를 보는 둥근 쿼드, 불투명 3D 다음에
-// 깊이 시험만 하고(쓰지 않음) 미리 곱한 알파로 섞는다. 더하기 섞기 파티클은 알파 0으로 낸다 (파이프라인 하나)
+// One particle (32 bytes like HLSL Particle, shaders/Particle.hlsl). A round quad facing the camera, after opaque 3D,
+// depth tested only (no writes) and blended with premultiplied alpha. Additive particles output alpha 0 (one pipeline)
 struct Particle {
     Vec3 position;
-    f32 size = 0.1f;   // 지름 (미터)
-    u32 color = 0xFFFFFFFF; // sRGB RGBA8 (rgba()), 곧은 알파
-    f32 rotation = 0.0f; // 라디안 (화면 안에서)
+    f32 size = 0.1f;   // diameter (meters)
+    u32 color = 0xFFFFFFFF; // sRGB RGBA8 (rgba()), straight alpha
+    f32 rotation = 0.0f; // radians (in screen space)
     u32 flags = 0;       // kParticleAdditive
-    f32 softness = 0.5f; // 가장자리 흐림 0 (딱딱한 원) .. 1 (가운데부터 흐려진다)
+    f32 softness = 0.5f; // edge blur 0 (hard circle) .. 1 (blurs from the center)
 };
 static_assert(sizeof(Particle) == 32, "Particle must match the HLSL layout");
 inline constexpr u32 kParticleAdditive = 1u;
-inline constexpr u32 kMaxParticlesPerFrame = 16384; // 넘으면 앞에서부터 (업로드 링 512 KB)
+inline constexpr u32 kMaxParticlesPerFrame = 16384; // beyond this, from the front (upload ring 512 KB)
 
-// 3D를 그릴 화면 영역(픽셀). width가 0이면 창 전체.
+// Screen area (pixels) to draw 3D in. Whole window if width is 0.
 struct Viewport {
     f32 x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
 };
 
-// 반사 프로브 하나 (씬의 reflection_probe 물체, asset::ModelCache::probes가 채운다). 물체는 자기 위치를 담은 영향 상자
-// 중 중심이 가장 가까운 프로브 하나의 반사 큐브를 쓴다 (섞지 않음). 어느 상자에도 없으면 하늘 HDRI 반사
+// One reflection probe (a scene reflection_probe object, filled by asset::ModelCache::probes). An object uses the reflection cube of the one probe
+// whose influence box contains its position with the closest center (no blending). If in no box, the sky HDRI reflection
 struct ReflectionProbe {
-    Vec3 position;     // 구운 자리 = 영향 상자 중심
-    Vec3 halfExtents;  // 영향 상자 (축 정렬, 월드)
-    u32 id = 0; // Renderer::createProbe 번호 (0 = 없음, 건너뛴다)
+    Vec3 position;     // baked position = influence box center
+    Vec3 halfExtents;  // influence box (axis-aligned, world)
+    u32 id = 0; // Renderer::createProbe index (0 = none, skipped)
 };
-inline constexpr u32 kMaxReflectionProbes = 64; // 셰이더가 물체마다 모두 훑는다 (씬당 한도는 프로젝트 설정 probeMaxCount)
+inline constexpr u32 kMaxReflectionProbes = 64; // the shader scans them all per object (per-scene limit is the project setting probeMaxCount)
 
-// 점광원 하나 (씬의 point_light 물체 = render::addSceneLights, 화면 쪽 효과의 잠깐 빛은 view/가 더한다). 그림자는 없다.
-// 렌더러가 물체(인스턴스)마다 영향이 큰 빛을 CPU로 최대 setLightsPerObject개 골라 셰이더에 번호를 넘긴다
+// One point light (a scene point_light object = render::addSceneLights; brief lights from view-side effects are added by view/). No shadows.
+// The renderer picks up to setLightsPerObject most influential lights per object (instance) on the CPU and passes their indices to the shader
 struct PointLight {
     Vec3 position;
-    f32 range = 6.0f;   // 이 거리에서 0이 된다 (미터)
-    Vec3 color{1, 1, 1}; // 선형 색 × 세기
+    f32 range = 6.0f;   // becomes 0 at this distance (meters)
+    Vec3 color{1, 1, 1}; // linear color × intensity
 };
-inline constexpr u32 kMaxPointLights = 255;      // 프레임당 (번호 8비트, 넘으면 앞에서부터)
-inline constexpr u32 kMaxLightsPerObject = 8;    // 인스턴스마다 번호 8개 (8바이트)
+inline constexpr u32 kMaxPointLights = 255;      // per frame (8-bit index, beyond this from the front)
+inline constexpr u32 kMaxLightsPerObject = 8;    // 8 indices per instance (8 bytes)
 
-// 태양 그림자 (CSM, docs/ROADMAP.md 2단계 "그림자"): 카메라 앞 distance까지를 단계 1~2개로 나눠 단계마다 size² 그림자 맵.
-// 프로젝트 설정 shadows*가 정한다(game::applyRenderStyle). 점광원은 그림자가 없다
+// Sun shadows (CSM, docs/ROADMAP.md stage 2 "Shadows"): splits up to distance in front of the camera into 1~2 cascades with a size² shadow map each.
+// Decided by project settings shadows* (game::applyRenderStyle). Point lights have no shadows
 struct ShadowSettings {
     bool enabled = true;
-    u32 cascades = 2;     // 1 또는 2
-    u32 size = 1024;      // 단계 하나의 그림자 맵 크기 (512..4096)
-    f32 distance = 40.0f; // 카메라에서 이 거리(미터)까지 그림자 (끝 10%에서 옅어진다)
+    u32 cascades = 2;     // 1 or 2
+    u32 size = 1024;      // shadow map size of one cascade (512..4096)
+    f32 distance = 40.0f; // shadows up to this distance (meters) from the camera (fading over the last 10%)
 };
 inline constexpr u32 kMaxShadowCascades = 2;
 
-// 포스트 프로세싱 (docs/ROADMAP.md 2단계 "포스트 프로세싱", shaders/Post.hlsl): 씬 환경의 값(scene::PostFields)을 게임·에디터가
-// 채운다. 화면용 값이라 결정론과 무관하다. 장면은 HDR(선형)로 그리고 우버 패스 하나가 톤 매핑해 백버퍼로 낸다
+// Post-processing (docs/ROADMAP.md stage 2 "Post-processing", shaders/Post.hlsl): the game/editor fill in the scene environment's values (scene::PostFields).
+// View values, unrelated to determinism. The scene is drawn in HDR (linear) and one uber pass tone maps it to the back buffer
 struct PostParams {
-    bool toneMapping = true; // false: 선형 값을 잘라 sRGB로만 (반사 프로브 굽기). 블룸·LUT·효과도 끈다
-    f32 exposure = 0.0f;     // EV (2배 = +1)
-    u32 lut = 0;             // 색 보정 LUT (createLut 번호, 0 = 없음)
-    f32 bloomIntensity = 0.25f; // 0 = 블룸 패스를 건너뛴다
-    f32 bloomThreshold = 1.0f;  // 이보다 밝은 빛만 (선형, 노출 전)
+    bool toneMapping = true; // false: linear values are only clamped to sRGB (reflection probe baking). Bloom/LUT/effects are off too
+    f32 exposure = 0.0f;     // EV (2x = +1)
+    u32 lut = 0;             // color grading LUT (createLut index, 0 = none)
+    f32 bloomIntensity = 0.25f; // 0 = skip the bloom pass
+    f32 bloomThreshold = 1.0f;  // only light brighter than this (linear, before exposure)
     Vec3 bloomTint{1.0f, 1.0f, 1.0f};
-    f32 vignette = 0.0f;           // 0..1 가장자리 어둡게
-    f32 vignetteSmoothness = 0.5f; // 시작 반지름 0..1
-    f32 grain = 0.0f;              // 필름 그레인 0..1
-    f32 chromaticAberration = 0.0f; // 색수차 (영역 크기 비율, 0.01 = 가장자리에서 1%)
+    f32 vignette = 0.0f;           // 0..1 darken edges
+    f32 vignetteSmoothness = 0.5f; // start radius 0..1
+    f32 grain = 0.0f;              // film grain 0..1
+    f32 chromaticAberration = 0.0f; // chromatic aberration (fraction of region size, 0.01 = 1% at the edge)
 };
 
-// 플레이어 설정 (settings::DisplaySettings·GameplaySettings): 효과 끄기, 밝기, 색맹 보정. 씬 값보다 먼저 적용된다
-enum class ColorBlindMode : u8 { Off, Protanopia, Deuteranopia, Tritanopia }; // settings::ColorBlindSetting과 같은 순서
+// Player settings (settings::DisplaySettings/GameplaySettings): disabling effects, brightness, color blindness correction. Applied before scene values
+enum class ColorBlindMode : u8 { Off, Protanopia, Deuteranopia, Tritanopia }; // same order as settings::ColorBlindSetting
 struct PostOptions {
     bool bloom = true;
-    bool antiAliasing = true; // FXAA (우버 패스 안)
+    bool antiAliasing = true; // FXAA (inside the uber pass)
     bool filmGrain = true;
     bool chromaticAberration = true;
-    f32 brightness = 1.0f; // 노출에 곱한다
-    ColorBlindMode colorBlind = ColorBlindMode::Off; // LUT 위에 겹친다 (CPU가 합쳐 LUT 하나)
+    f32 brightness = 1.0f; // multiplied into exposure
+    ColorBlindMode colorBlind = ColorBlindMode::Off; // layered on top of the LUT (the CPU combines them into one LUT)
 };
 inline constexpr u32 kLutSize = 32;
 
-// 동적 해상도 (docs/ROADMAP.md 2단계 "동적 해상도"): 본 화면 3D를 HDR 대상의 줄인 영역에 그리고 우버 패스가 원래 해상도로
-// 늘려(이중 선형 + 대비 적응 샤프닝) 낸다. UI는 늘 원래 해상도. 조절기는 GPU 프레임 시간이 budgetMs를 넘으면 배율을 낮추고
-// 여유가 있으면 maxScale까지 천천히 올린다. 오프스크린(drawToTarget)과 보기 모드는 늘 1
+// Dynamic resolution (docs/ROADMAP.md stage 2 "Dynamic resolution"): the main view 3D is drawn into a reduced area of the HDR target and the uber pass upscales it to native resolution
+// (bilinear + contrast adaptive sharpening). UI is always native resolution. The controller lowers the scale when GPU frame time exceeds budgetMs
+// and raises it slowly up to maxScale when there's headroom. Offscreen (drawToTarget) and view modes are always 1
 struct ResolutionSettings {
-    bool dynamic = false;  // 프로젝트 설정 dynamicResolution (꺼지면 maxScale 고정)
-    f32 minScale = 0.5f;   // 프로젝트 설정 dynamicResolutionMinScale
-    f32 maxScale = 1.0f;   // 플레이어 설정 렌더 배율 (setRenderScale)
-    f32 budgetMs = 8.0f;   // 프로젝트 GPU 예산의 합
-    f32 sharpness = 0.5f;  // 줄였을 때 샤프닝 0..1
-}; // 색 보정 LUT 한 변 (.cube는 이 크기로 다시 뽑는다)
+    bool dynamic = false;  // project setting dynamicResolution (fixed at maxScale when off)
+    f32 minScale = 0.5f;   // project setting dynamicResolutionMinScale
+    f32 maxScale = 1.0f;   // player setting render scale (setRenderScale)
+    f32 budgetMs = 8.0f;   // sum of the project GPU budget
+    f32 sharpness = 0.5f;  // sharpening when reduced 0..1
+}; // side length of the color grading LUT (.cube files are resampled to this size)
 
 struct FrameParams {
     Viewport viewport;
     Mat4 viewProj;
     Vec3 cameraPos;
-    Vec3 cameraForward{0.0f, 0.0f, 1.0f}; // 소리 리스너 방향 (엔진이 프레임마다 audio::Engine::setListener에 넘긴다)
-    Vec3 sunDirection{0.4f, 0.8f, 0.3f}; // 태양을 향하는 방향 (정규화는 렌더러가 한다)
+    Vec3 cameraForward{0.0f, 0.0f, 1.0f}; // sound listener direction (the engine passes it to audio::Engine::setListener every frame)
+    Vec3 sunDirection{0.4f, 0.8f, 0.3f}; // direction toward the sun (the renderer normalizes it)
     Vec3 sunColor{1.0f, 0.95f, 0.85f};
-    Vec3 skyColor{0.30f, 0.38f, 0.50f}; // 선형 색 공간
+    Vec3 skyColor{0.30f, 0.38f, 0.50f}; // linear color space
     Vec3 groundColor{0.20f, 0.17f, 0.14f};
-    Vec3 fogColor{0.50f, 0.62f, 0.78f}; // 배경 지우기 색으로도 쓴다
+    Vec3 fogColor{0.50f, 0.62f, 0.78f}; // also used as the background clear color
     f32 fogDensity = 0.008f;
-    // 화면 전체를 이 색(선형)으로 섞는다 (연출 표의 번쩍임, 엔진이 feedback::Player에서 채운다). 0 = 없음
+    // Blends the whole screen toward this color (linear) (flash from the feedback table, filled by the engine from feedback::Player). 0 = none
     Vec3 tintColor{1.0f, 1.0f, 1.0f};
     f32 tintAmount = 0.0f;
-    DebugView debugView = DebugView::None; // 에디터 보기 모드
-    // 화면 시간 (초, 바람 흔들림). 그래픽 회귀 테스트는 0으로 둔다
+    DebugView debugView = DebugView::None; // editor view mode
+    // View time (seconds, wind sway). Graphics regression tests keep it at 0
     f32 time = 0.0f;
-    Vec3 windDirection{1.0f, 0.0f, 0.3f}; // 수평 방향 (정규화는 렌더러가 한다)
-    f32 windStrength = 1.0f;              // 머티리얼 windStrength에 곱한다 (0 = 바람 없음)
-    // 하늘 HDRI (Renderer::createEnvironment 번호, 0 = 없음: 하늘·땅 색 그라디언트와 안개 색 배경). 있으면 스카이박스를 그리고
-    // 환경광(SH)·반사(큐브 밉 = 거칠기)를 그 HDRI에서 읽는다. 세기는 하늘·환경광·반사 모두에 곱하고, 회전은 y축 (라디안)
+    Vec3 windDirection{1.0f, 0.0f, 0.3f}; // horizontal direction (the renderer normalizes it)
+    f32 windStrength = 1.0f;              // multiplied into material windStrength (0 = no wind)
+    // Sky HDRI (Renderer::createEnvironment index, 0 = none: sky/ground color gradient and fog color background). If present, the skybox is drawn and
+    // ambient (SH) and reflections (cube mips = roughness) are read from that HDRI. Intensity multiplies sky/ambient/reflections, rotation is about the y axis (radians)
     u32 environment = 0;
     f32 environmentIntensity = 1.0f;
     f32 environmentRotation = 0.0f;
-    // 반사 프로브 (부르는 쪽 메모리, beginFrame/drawToTarget 동안만 읽는다). kMaxReflectionProbes를 넘으면 앞에서부터
+    // Reflection probes (caller's memory, read only during beginFrame/drawToTarget). Beyond kMaxReflectionProbes, from the front
     const ReflectionProbe* probes = nullptr;
     u32 probeCount = 0;
-    // 점광원 (부르는 쪽 메모리, 프레임 동안 읽는다). kMaxPointLights를 넘으면 앞에서부터
+    // Point lights (caller's memory, read during the frame). Beyond kMaxPointLights, from the front
     const PointLight* lights = nullptr;
     u32 lightCount = 0;
-    PostParams post; // 보기 모드에서는 쓰지 않는다 (색을 그대로)
+    PostParams post; // not used in view modes (colors as is)
 };
 
-// 하늘 HDRI에서 구운 환경 (asset::EnvironmentMap, 큐브는 RGB9E5, 면 +X −X +Y −Y +Z −Z 차례로). createEnvironment가 GPU에 올린다
+// Environment baked from a sky HDRI (asset::EnvironmentMap, cubes in RGB9E5, faces +X −X +Y −Y +Z −Z in order). createEnvironment uploads it to the GPU
 struct EnvironmentData {
-    f32 sh[9][3] = {}; // 환경광 색 = Σ sh[i] · Y_i(n)
+    f32 sh[9][3] = {}; // ambient color = Σ sh[i] · Y_i(n)
     u32 skySize = 0;
-    const u32* sky = nullptr; // 면마다 skySize²
+    const u32* sky = nullptr; // skySize² per face
     u32 reflectSize = 0, reflectMips = 0;
-    const u32* reflect = nullptr; // 면마다 밉 0부터
+    const u32* reflect = nullptr; // per face from mip 0
 };
 
 struct RendererDesc {
@@ -232,54 +232,54 @@ struct RendererDesc {
     bool gpuCapture = false; // --gpu-capture (rhi/GpuCapture.h)
 };
 
-// GPU 조사는 RHI 백엔드가 한다 (출시 exe의 --system-info, 최소 사양 검사)
+// GPU inspection is done by the RHI backend (shipping exe --system-info, min-spec check)
 using GpuInfo = rhi::GpuInfo;
 using rhi::gpuMinimumError;
 using rhi::queryGpu;
 
-// GPU 패스: 프레임 GPU 시간을 나눠 재는 구간 (벤치마크 보고서의 GPU 예산 표, mealkit.project gpuBudget*).
-// 아직 없는 패스(그림자·포스트·VFX)는 그 기능이 들어올 때 렌더러가 재기 시작한다 (그때까지 0)
+// GPU passes: sections that split frame GPU time for measurement (GPU budget table in the benchmark report, mealkit.project gpuBudget*).
+// Passes not yet present (shadow/post/VFX) start being measured by the renderer when those features arrive (0 until then)
 enum class GpuPass : u8 { Opaque, Shadow, Post, Vfx, Ui, Count };
 inline constexpr u32 kGpuPassCount = static_cast<u32>(GpuPass::Count);
-const char* gpuPassName(GpuPass pass); // "opaque", "shadow", ... (보고서·로그, 영어)
+const char* gpuPassName(GpuPass pass); // "opaque", "shadow", ... (reports/logs, English)
 
 struct RenderStats {
     u32 drawCalls = 0;
     u32 instances = 0;
-    u32 culled = 0; // 프러스텀 밖이라 빠진 인스턴스 (DrawList::submit)
-    // GPU 시간 (타임스탬프): GPU가 끝낸 가장 최근 프레임 값이라 2프레임 늦다. gpuValid가 false면 모른다
+    u32 culled = 0; // instances dropped for being outside the frustum (DrawList::submit)
+    // GPU time (timestamps): values from the most recent frame the GPU finished, so 2 frames late. Unknown if gpuValid is false
     bool gpuValid = false;
     f32 gpuFrameMs = 0.0f;
     f32 gpuPassMs[kGpuPassCount] = {};
-    f32 resolutionScale = 1.0f; // 이번 프레임 본 화면 3D 배율 (동적 해상도)
+    f32 resolutionScale = 1.0f; // main view 3D scale this frame (dynamic resolution)
 };
 
-// 2D UI 사각형 하나 (HLSL UiQuad와 같은 112바이트, shaders/Ui.hlsl). mealkit/ui/가 채운다. 좌표는 백버퍼 픽셀.
+// One 2D UI rectangle (112 bytes like HLSL UiQuad, shaders/Ui.hlsl). Filled by mealkit/ui/. Coordinates in back buffer pixels.
 struct UiQuad {
-    f32 rect[4] = {};                    // x, y, w, h (회전 전 상자)
-    f32 clip[4] = {-1e9f, -1e9f, 1e9f, 1e9f}; // x0, y0, x1, y1 (이 밖은 그리지 않는다)
-    f32 radii[4] = {};                   // 왼쪽 위, 오른쪽 위, 오른쪽 아래, 왼쪽 아래
-    f32 uv[4] = {};                      // 아틀라스 u0, v0, u1, v1 (이미지·글자)
-    f32 gradient[4] = {};                // 선형: 시작 xy, 끝 xy / 원형: 중심 xy, 반지름 xy (상자 0..1 좌표)
-    u32 color0 = 0;                      // sRGB RGBA8 (rgba()), 곧은 알파
+    f32 rect[4] = {};                    // x, y, w, h (box before rotation)
+    f32 clip[4] = {-1e9f, -1e9f, 1e9f, 1e9f}; // x0, y0, x1, y1 (nothing drawn outside)
+    f32 radii[4] = {};                   // top left, top right, bottom right, bottom left
+    f32 uv[4] = {};                      // atlas u0, v0, u1, v1 (images/text)
+    f32 gradient[4] = {};                // linear: start xy, end xy / radial: center xy, radius xy (box 0..1 coordinates)
+    u32 color0 = 0;                      // sRGB RGBA8 (rgba()), straight alpha
     u32 color1 = 0;
     u32 strokeColor = 0;
     u32 flags = 0; // kUiShape/Image/Glyph/Shadow | kUiLinear/kUiRadial
     f32 strokeWidth = 0.0f;
-    f32 rotation = 0.0f; // 라디안, 상자 가운데 기준
-    f32 softness = 0.0f; // 그림자 흐림 (픽셀)
-    f32 sdfScale = 0.0f; // 글자: SDF 값 1당 화면 픽셀
+    f32 rotation = 0.0f; // radians, around the box center
+    f32 softness = 0.0f; // shadow blur (pixels)
+    f32 sdfScale = 0.0f; // text: screen pixels per SDF value unit
 };
 static_assert(sizeof(UiQuad) == 112, "UiQuad must match the HLSL layout");
 
 inline constexpr u32 kUiShape = 0, kUiImage = 1, kUiGlyph = 2, kUiShadow = 3;
 inline constexpr u32 kUiLinear = 1u << 4, kUiRadial = 2u << 4;
 
-enum class UiAtlas : u8 { Glyphs, Images }; // 글자 SDF (1바이트), UI 이미지 (RGBA 4바이트)
+enum class UiAtlas : u8 { Glyphs, Images }; // glyph SDF (1 byte), UI images (RGBA 4 bytes)
 inline constexpr u32 kUiAtlasSize = 2048;
 
-// 포워드 렌더러 (RHI 위, 그래픽 API를 직접 부르지 않는다). 프레임 2개를 동시에 처리하고, 프레임별 데이터는
-// RHI 업로드 링에 쓴다. 내장 그래픽(UMA)에서는 업로드 메모리가 곧 GPU가 읽는 메모리라 복사가 전혀 없다.
+// Forward renderer (on top of the RHI, doesn't call graphics APIs directly). Processes 2 frames concurrently, and per-frame data
+// is written to the RHI upload ring. On integrated graphics (UMA) the upload memory is the memory the GPU reads, so there's no copy at all.
 class Renderer {
 public:
     Renderer() = default;
@@ -292,86 +292,86 @@ public:
     void resize(u32 width, u32 height);
 
     MeshId createMesh(const MeshData& mesh);
-    // 정점의 material 번호가 가리킨다. 0번은 기본 흰색 (init이 만든다)
+    // Referenced by vertex material indices. Index 0 is default white (created by init)
     u32 createMaterial(const MaterialData& material);
-    // 밉이 있는 텍스처 (asset::TextureCache). 셰이더가 읽는 bindless 번호
+    // Texture with mips (asset::TextureCache). The bindless index read by shaders
     u32 createTexture(const rhi::TextureInit& init);
-    // 메시 로컬 바운딩 구 (createMesh가 정점에서 구한다). 없는 메시는 반지름 0
+    // Mesh local bounding sphere (createMesh computes it from vertices). Radius 0 for missing meshes
     BoundingSphere meshBounds(MeshId mesh) const;
-    // 이번 프레임 viewProj의 프러스텀 (beginFrame이 만든다). DrawList::submit이 인스턴스를 거른다
+    // Frustum of this frame's viewProj (made by beginFrame). DrawList::submit filters instances with it
     const Frustum& frustum() const;
-    void addCulled(u32 count); // 통계용 (DrawList::submit)
+    void addCulled(u32 count); // for stats (DrawList::submit)
 
-    // 하늘 HDRI 환경을 GPU에 올리고 번호를 준다 (FrameParams::environment). 지우지 않는다: 같은 HDRI는 쓰는 쪽(ModelCache)이 번호를 다시 쓴다
+    // Uploads a sky HDRI environment to the GPU and returns an index (FrameParams::environment). Not deleted: the user (ModelCache) reuses the index for the same HDRI
     u32 createEnvironment(const EnvironmentData& data);
-    // 반사 프로브 큐브 (asset::ProbeMap: RGB9E5, 면마다 밉 0부터)를 올리고 번호를 준다 (ReflectionProbe::id). 지우지 않는다
+    // Uploads a reflection probe cube (asset::ProbeMap: RGB9E5, per face from mip 0) and returns an index (ReflectionProbe::id). Not deleted
     u32 createProbe(u32 size, u32 mips, const u32* reflect);
-    // 조명 모델 (프로젝트 설정, game::applyRenderStyle). 파이프라인은 init이 모두 만들어 두어 바로 바뀐다
+    // Lighting model (project setting, game::applyRenderStyle). All pipelines are prebuilt by init, so it switches immediately
     void setLightingModel(LightingModel model);
     LightingModel lightingModel() const;
-    // 툰 램프: 가로 그림의 왼쪽(어두운 면) → 오른쪽(밝은 면) 색을 확산 조명에 곱한다 (첫 줄만 쓴다). nullptr = 엔진 기본 3단계
+    // Toon ramp: colors from the left (dark side) → right (lit side) of a horizontal image multiplied into diffuse lighting (only the first row is used). nullptr = engine default 3 steps
     void setToonRamp(const Image* ramp);
-    // 물체마다 쓰는 점광원 수 (프로젝트 설정 pointLightsPerObject, 1..kMaxLightsPerObject, 기본 4)
+    // Point lights used per object (project setting pointLightsPerObject, 1..kMaxLightsPerObject, default 4)
     void setLightsPerObject(u32 count);
-    // 태양 그림자 (프로젝트 설정). 크기·단계 수가 바뀌면 그림자 맵을 새로 만든다 (옛 것은 남는다)
+    // Sun shadows (project setting). When size/cascade count change, a new shadow map is made (the old one remains)
     void setShadows(const ShadowSettings& shadows);
     const ShadowSettings& shadows() const;
-    // 그림자 패스: DrawList::submit이 본 화면 3D보다 먼저 부른다 (이 프레임에 한 번, 그림자가 꺼졌으면 아무것도 하지 않는다).
-    // 프러스텀 컬링 전의 모든 인스턴스가 그림자를 드리운다 (단계마다 빛 쪽 상자로 거른다)
+    // Shadow pass: DrawList::submit calls it before the main view 3D (once per frame; does nothing if shadows are off).
+    // All instances before frustum culling cast shadows (filtered per cascade by the light-space box)
     void drawShadows(const DrawList& list);
 
-    // false면 이번 프레임은 그리지 않는다 (최소화 등).
+    // If false, this frame isn't drawn (minimized etc.).
     bool beginFrame(const FrameParams& params);
-    // 같은 메시의 인스턴스를 드로우 콜 1회로 그린다.
+    // Draws instances of the same mesh in one draw call.
     void drawInstances(MeshId mesh, const InstanceData* instances, u32 count);
-    // 스킨 메시 하나 (캐릭터마다 드로우 콜 1회): bones는 asset::skinPalette의 팔레트 (관절 수, 최대 64)
+    // One skinned mesh (one draw call per character): bones is the palette from asset::skinPalette (joint count, max 64)
     void drawSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount);
     bool meshSkinned(MeshId mesh) const;
-    // 파티클 (DrawList::submit이 불투명 3D 다음에 부른다): 드로우 콜 1회, GPU 패스 Vfx
+    // Particles (DrawList::submit calls it after opaque 3D): one draw call, GPU pass Vfx
     void drawParticles(const Particle* particles, u32 count);
-    // 색 보정 LUT (asset::loadCubeLut): kLutSize³ 칸의 sRGB 값 rgb (빨강이 가장 빨리 바뀐다). 번호는 PostParams::lut.
-    // 지우지 않는다: 같은 파일은 쓰는 쪽(ModelCache)이 번호를 다시 쓴다
+    // Color grading LUT (asset::loadCubeLut): rgb sRGB values of kLutSize³ cells (red changes fastest). The index is PostParams::lut.
+    // Not deleted: the user (ModelCache) reuses the index for the same file
     u32 createLut(const f32* rgb);
-    void setPostOptions(const PostOptions& options); // 플레이어 설정 (색맹 보정이 바뀌면 LUT를 다시 만든다)
+    void setPostOptions(const PostOptions& options); // player settings (rebuilds LUTs when color blindness correction changes)
     const PostOptions& postOptions() const;
-    // 동적 해상도: 프로젝트 쪽 값(dynamic·minScale·budgetMs·sharpness, game::applyRenderStyle)과 플레이어 렌더 배율(settings)을 따로 넣는다
+    // Dynamic resolution: project-side values (dynamic/minScale/budgetMs/sharpness, game::applyRenderStyle) and the player render scale (settings) are set separately
     void setDynamicResolution(bool dynamic, f32 minScale, f32 budgetMs, f32 sharpness);
     void setRenderScale(f32 maxScale); // 0.5..1
     const ResolutionSettings& resolution() const;
-    // 오프스크린 그림 (에디터 룩데브 창, 반사 프로브 굽기): 8비트 sRGB 대상과 같은 크기의 HDR 장면 대상을 짝으로 만든다.
-    // 크기를 정해 한 번 만들고 계속 쓴다 (지우지 않는다)
+    // Offscreen rendering (editor lookdev window, reflection probe baking): makes an 8-bit sRGB target paired with an HDR scene target of the same size.
+    // Made once with a fixed size and reused (not deleted)
     rhi::RenderTarget createRenderTarget(u32 width, u32 height);
     rhi::Texture renderTargetTexture(rhi::RenderTarget target) const; // ImGui::Image (rhi::imguiTextureId)
-    // 본 화면 3D(DrawList::submit) 다음, UI 전에: 대상 전체에 params의 카메라·빛·포스트와 lighting 조명 모델로 list를 그린다.
-    // 본 화면은 여기서 포스트를 거쳐 백버퍼로 나가므로 이 뒤에 본 화면 3D를 그리지 않는다 (UI는 beginOverlay가 다시 묶는다)
+    // After the main view 3D (DrawList::submit), before UI: draws list over the whole target with params' camera/lights/post and the lighting model.
+    // The main view goes through post to the back buffer here, so no main view 3D is drawn after this (beginOverlay rebinds for UI)
     void drawToTarget(rhi::RenderTarget target, const FrameParams& params, const DrawList& list, LightingModel lighting);
-    // 3D 이후 UI를 그리기 위해 백버퍼를 묶는다 (본 화면 3D는 여기서 포스트를 거쳐 백버퍼로 나간다)
+    // Binds the back buffer to draw UI after 3D (the main view 3D goes through post to the back buffer here)
     void beginOverlay();
-    // UI 아틀라스의 한 영역을 바꾼다 (언제든, 다음 drawUi 전에 GPU에 올린다). pixels는 w×h, 행 사이 빈틈 없음
+    // Changes one region of a UI atlas (anytime; uploaded to the GPU before the next drawUi). pixels are w×h with no gaps between rows
     void updateUiAtlas(UiAtlas atlas, u32 x, u32 y, u32 w, u32 h, const u8* pixels);
-    // 2D UI를 그린다: 3D 다음, 백버퍼 원래 해상도(동적 해상도와 무관), 깊이 없음. 드로우 콜 1회
+    // Draws 2D UI: after 3D, at native back buffer resolution (independent of dynamic resolution), no depth. One draw call
     void drawUi(const UiQuad* quads, u32 count);
     void endFrame();
     void waitIdle();
 
-    rhi::Device& device(); // 디버그 UI 그리기 (rhi::imgui*)
+    rhi::Device& device(); // debug UI drawing (rhi::imgui*)
     u32 width() const;
     u32 height() const;
 
     void setVsync(bool enabled);
     bool vsync() const;
-    void requestCapture(const char* pngPath); // 다음 endFrame에서 백버퍼를 PNG로 저장
-    // 이번 프레임 endFrame에서 오프스크린 대상(drawToTarget으로 그린)을 읽어 out에 둔다 (sRGB 8비트, GPU를 기다린다).
-    // 반사 프로브 굽기. out은 endFrame까지 살아 있어야 한다. 같은 프레임의 requestCapture는 다음 프레임으로 미룬다
+    void requestCapture(const char* pngPath); // saves the back buffer as a PNG at the next endFrame
+    // At this frame's endFrame, reads the offscreen target (drawn with drawToTarget) into out (sRGB 8-bit, waits for the GPU).
+    // Reflection probe baking. out must live until endFrame. requestCapture in the same frame is deferred to the next frame
     void captureTarget(rhi::RenderTarget target, Image* out);
 
     const char* adapterName() const;
     const GpuInfo& gpu() const;
-    const char* initError() const; // init()이 false일 때 이유
+    const char* initError() const; // reason when init() returns false
     bool isUma() const;
     const RenderStats& stats() const;
-    bool supportsDebugView(DebugView view) const; // 이 빌드·장치가 그 보기 모드를 그릴 수 있다
-    rhi::GpuMemory gpuMemory() const; // 드라이버 질의라 매 프레임 부르지 않는다 (FrameStats는 보고 주기마다)
+    bool supportsDebugView(DebugView view) const; // whether this build/device can draw that view mode
+    rhi::GpuMemory gpuMemory() const; // a driver query, so not called every frame (FrameStats does it every report period)
 
 private:
     struct Impl;

@@ -11,15 +11,15 @@ u16 toHalf(f32 f) {
     const u32 sign = (x >> 16) & 0x8000u;
     const i32 exp = static_cast<i32>((x >> 23) & 0xFF) - 127 + 15;
     u32 mant = x & 0x7FFFFFu;
-    if (exp <= 0) { // 아주 작은 값: 비정규 half 또는 0
+    if (exp <= 0) { // very small value: denormal half or 0
         if (exp < -10) return static_cast<u16>(sign);
         mant |= 0x800000u;
         const u32 shift = static_cast<u32>(14 - exp);
         return static_cast<u16>(sign | ((mant + (1u << (shift - 1))) >> shift));
     }
-    if (exp >= 31) return static_cast<u16>(sign | 0x7C00u); // 무한대 (NaN도)
+    if (exp >= 31) return static_cast<u16>(sign | 0x7C00u); // infinity (NaN too)
     const u32 h = sign | (static_cast<u32>(exp) << 10) | (mant >> 13);
-    return static_cast<u16>(h + ((mant >> 12) & 1u)); // 반올림 (올림이 지수로 넘어가도 맞다)
+    return static_cast<u16>(h + ((mant >> 12) & 1u)); // rounding (correct even if the carry overflows into the exponent)
 }
 } // namespace
 
@@ -34,7 +34,7 @@ MeshData makeBox() {
     for (const Vec3& n : normals) {
         Vec3 u = n.x != 0.0f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
         Vec3 v = cross(n, u);
-        // D3D 기본값은 시계 방향이 앞면이다. 아래 정점 순서에서 앞면 조건은 cross(v, u)가 n과 같은 방향일 때다.
+        // D3D's default front face is clockwise. With the vertex order below, the front face condition is cross(v, u) pointing the same way as n.
         if (dot(cross(v, u), n) < 0.0f) {
             const Vec3 t = u;
             u = v;

@@ -6,15 +6,15 @@
 #include <memory>
 #include <string>
 
-// 셰이더 핫 리로드 (엔진 개발용, docs/ROADMAP.md 2단계 "셰이더 핫 리로드"). 개발 빌드(MEALKIT_SHADER_HOT_RELOAD,
-// 디버그 UI가 있는 빌드)에서 engine/shaders의 .hlsl·Bindless.hlsli가 바뀌면 빌드와 같은 DXC·같은 옵션으로 다시 컴파일하고
-// 파이프라인을 바꿔 끼운다. 컴파일 오류는 로그에 남기고 이전 셰이더를 계속 쓴다. 출시 빌드(build.bat Export)는 박아 넣은
-// 바이트코드만 쓰고 이것은 아무것도 하지 않는다. 엔진 폴더나 DXC가 없는 PC(복사한 개발 exe)에서도 꺼진다.
+// Shader hot reload (for engine development, docs/ROADMAP.md stage 2 "Shader hot reload"). In dev builds (MEALKIT_SHADER_HOT_RELOAD,
+// builds with debug UI), when .hlsl/Bindless.hlsli in engine/shaders change, recompiles with the same DXC and options as the build
+// and swaps the pipelines. Compile errors are logged and the previous shader keeps being used. Shipping builds (build.bat Export) use only embedded
+// bytecode and this does nothing. Also off on PCs without the engine folder or DXC (a copied dev exe).
 namespace mealkit::render {
 
 class ShaderReloader {
 public:
-    // 바이트코드를 받아 파이프라인을 다시 만든다. 실패하면 false (이전 것을 계속 쓴다)
+    // Receives bytecode and rebuilds the pipeline. false on failure (keeps using the previous one)
     using Apply = std::function<bool(const rhi::ShaderCode& vs, const rhi::ShaderCode& ps)>;
 
     ShaderReloader();
@@ -22,11 +22,11 @@ public:
     ShaderReloader(const ShaderReloader&) = delete;
     ShaderReloader& operator=(const ShaderReloader&) = delete;
 
-    // engine/shaders/<file>의 정점·픽셀 진입점 (기본 VSMain + PSMain). defines는 "LIGHTING_MODEL=1"처럼 정의 하나 (CMakeLists의
-    // mealkit_shader 변형과 같게, 비면 없음)
+    // Vertex/pixel entry points of engine/shaders/<file> (default VSMain + PSMain). defines is a single define like "LIGHTING_MODEL=1" (same as the
+    // mealkit_shader variants in CMakeLists; none if empty)
     void add(const char* file, Apply apply, const char* vsEntry = "VSMain", const char* psEntry = "PSMain",
              const char* defines = "");
-    // 매 프레임, 프레임 밖에서. 0.5초마다 파일 시각을 보고, 컴파일은 프로세스로 돌려 기다리지 않는다
+    // Every frame, outside a frame. Checks file times every 0.5 s, and compiles in a process without waiting
     void update();
     bool enabled() const;
 
