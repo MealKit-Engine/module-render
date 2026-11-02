@@ -292,6 +292,8 @@ public:
     void resize(u32 width, u32 height);
 
     MeshId createMesh(const MeshData& mesh);
+    // New contents for an existing mesh (same id; old buffers deleted after waiting for the GPU). Outside a frame (editor terrain brushes)
+    void replaceMesh(MeshId id, const MeshData& mesh);
     // Referenced by vertex material indices. Index 0 is default white (created by init)
     u32 createMaterial(const MaterialData& material);
     // Texture with mips (asset::TextureCache). The bindless index read by shaders

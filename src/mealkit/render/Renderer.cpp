@@ -643,6 +643,16 @@ u32 Renderer::createTexture(const rhi::TextureInit& init) {
     return m->device.textureIndex(t);
 }
 
+void Renderer::replaceMesh(MeshId id, const MeshData& data) {
+    if (!m || id >= m->meshes.size() || data.vertices.empty() || data.indices.empty()) return;
+    const MeshId fresh = createMesh(data);
+    GpuMesh& old = m->meshes[id];
+    m->device.destroyBuffer(old.vertexBuffer);
+    m->device.destroyBuffer(old.indexBuffer);
+    old = m->meshes[fresh];
+    m->meshes.pop_back();
+}
+
 MeshId Renderer::createMesh(const MeshData& data) {
     if (data.vertices.empty() || data.indices.empty()) {
         MEALKIT_WARN("createMesh: empty mesh");
