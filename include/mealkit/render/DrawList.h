@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mealkit/jobs/Jobs.h"
 #include "mealkit/render/Renderer.h"
 
 #include <algorithm>
@@ -7,6 +8,50 @@
 #include <vector>
 
 namespace mealkit::render {
+
+// Culling work buffers, reused between frames: visible[mesh] = that bucket's instances inside the frustum (in bucket order)
+struct CullScratch {
+    std::vector<std::vector<InstanceData>> visible;
+    std::vector<u8> inside;   // one flag per instance, all buckets back to back
+    std::vector<size_t> first; // first flag of each bucket (+ total at the end)
+};
+
+// Frustum culling of the first meshCount buckets on the job workers (mealkit/jobs/Jobs.h).
+// The flags are computed in parallel over all instances (balanced even when one bucket holds most of them, e.g. scatter grass),
+// then each bucket is compacted in order, so the result is the same as a serial loop.
+template <class BoundsOf>
+void cullInstances(const std::vector<std::vector<InstanceData>>& buckets, size_t meshCount, const Frustum& frustum, BoundsOf&& boundsOf,
+                   CullScratch& out) {
+    out.visible.resize(std::max(out.visible.size(), meshCount));
+    out.first.resize(meshCount + 1);
+    size_t total = 0;
+    for (size_t mesh = 0; mesh < meshCount; ++mesh) {
+        out.first[mesh] = total;
+        total += buckets[mesh].size();
+    }
+    out.first[meshCount] = total;
+    out.inside.resize(total);
+    constexpr u32 kChunk = 512; // const-ok: instances per job (smaller isn't worth a job)
+    jobs::parallelFor(static_cast<u32>(total), kChunk, [&](u32 begin, u32 end) {
+        size_t mesh = static_cast<size_t>(std::upper_bound(out.first.begin(), out.first.end(), begin) - out.first.begin()) - 1;
+        BoundingSphere b = boundsOf(mesh);
+        for (u32 i = begin; i < end; ++i) {
+            while (i >= out.first[mesh + 1]) b = boundsOf(++mesh);
+            const InstanceData& inst = buckets[mesh][i - out.first[mesh]];
+            const Vec3 s = inst.scale;
+            const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
+            const Vec3 c = inst.position + rotate(inst.rotation, Vec3{b.center.x * s.x, b.center.y * s.y, b.center.z * s.z});
+            out.inside[i] = frustum.sphereVisible(c, b.radius * scale) ? 1 : 0;
+        }
+    });
+    for (size_t mesh = 0; mesh < meshCount; ++mesh) {
+        std::vector<InstanceData>& visible = out.visible[mesh];
+        visible.clear();
+        const auto& bucket = buckets[mesh];
+        for (size_t k = 0; k < bucket.size(); ++k)
+            if (out.inside[out.first[mesh] + k]) visible.push_back(bucket[k]);
+    }
+}
 
 // Gathers instances to draw in one frame per mesh. submit() issues one draw call per mesh.
 // Call submit after renderer.beginFrame; instances outside that frame's frustum (by mesh bounding sphere) aren't uploaded to the GPU.
@@ -47,20 +92,12 @@ public:
     void submit(Renderer& renderer) const {
         renderer.drawShadows(*this); // shadow maps first (before binding the main view)
         const Frustum& frustum = renderer.frustum();
+        cullInstances(m_buckets, m_buckets.size(), frustum, [&](size_t mesh) { return renderer.meshBounds(static_cast<MeshId>(mesh)); }, m_cull);
         for (size_t mesh = 0; mesh < m_buckets.size(); ++mesh) {
-            const auto& bucket = m_buckets[mesh];
-            if (bucket.empty()) continue;
-            const BoundingSphere b = renderer.meshBounds(static_cast<MeshId>(mesh));
-            m_visible.clear();
-            for (const InstanceData& inst : bucket) {
-                const Vec3 s = inst.scale;
-                const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
-                const Vec3 c = inst.position + rotate(inst.rotation, Vec3{b.center.x * s.x, b.center.y * s.y, b.center.z * s.z});
-                if (frustum.sphereVisible(c, b.radius * scale)) m_visible.push_back(inst);
-            }
-            renderer.addCulled(static_cast<u32>(bucket.size() - m_visible.size()));
-            if (!m_visible.empty())
-                renderer.drawInstances(static_cast<MeshId>(mesh), m_visible.data(), static_cast<u32>(m_visible.size()));
+            const auto& visible = m_cull.visible[mesh];
+            renderer.addCulled(static_cast<u32>(m_buckets[mesh].size() - visible.size()));
+            if (!visible.empty())
+                renderer.drawInstances(static_cast<MeshId>(mesh), visible.data(), static_cast<u32>(visible.size()));
         }
         for (const SkinnedItem& item : m_skinned) {
             const BoundingSphere b = renderer.meshBounds(item.mesh);
@@ -84,7 +121,7 @@ private:
     std::vector<SkinnedItem> m_skinned;
     std::vector<BoneMatrix> m_bones;
     std::vector<Particle> m_particles;
-    mutable std::vector<InstanceData> m_visible; // submit's work buffer (reused between frames)
+    mutable CullScratch m_cull; // submit's culling buffers (reused between frames)
 };
 
 } // namespace mealkit::render

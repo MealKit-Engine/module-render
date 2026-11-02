@@ -1,6 +1,7 @@
 #include "mealkit/render/Renderer.h"
 
 #include "mealkit/core/Log.h"
+#include "mealkit/jobs/Jobs.h"
 #include "mealkit/platform/Image.h"
 #include "mealkit/render/DrawList.h"
 #include "mealkit/render/ShaderReload.h"
@@ -203,6 +204,7 @@ rhi::PipelineDesc skinnedDesc(rhi::PipelineDesc d, rhi::ShaderCode vs) {
 
 struct Renderer::Impl {
     rhi::Device device;
+    CullScratch shadowCull; // drawShadows' per-cascade culling buffers (reused between frames)
     rhi::Pipeline forward[kLightingModelCount]; // one per lighting model (init builds all: switching doesn't hitch)
     rhi::Pipeline outline;                      // outline pass (inverted hull)
     // Skinned mesh variants (only the vertex shader differs: SKINNED=1). The two view modes only in debug UI builds
@@ -445,6 +447,7 @@ Renderer::~Renderer() { shutdown(); }
 
 bool Renderer::init(const RendererDesc& desc) {
     m = new Impl();
+    jobs::acquire(); // culling workers (shared with physics); released in shutdown
     m->vsync = desc.vsync;
     if (!m->device.init({desc.window, desc.width, desc.height, desc.debugLayer, desc.gpuCapture})) return false;
 
@@ -605,6 +608,7 @@ void Renderer::shutdown() {
     m->device.shutdown();
     delete m;
     m = nullptr;
+    jobs::release();
 }
 
 void Renderer::resize(u32 width, u32 height) {
@@ -853,21 +857,14 @@ void Renderer::drawShadows(const DrawList& list) {
     cmd.beginTarget(m->shadowTarget, none, 0.0f);
     cmd.setPipeline(m->shadowPipeline);
     const f32 size = static_cast<f32>(m->shadowTargetSize);
-    std::vector<InstanceData> visible;
     for (u32 c = 0; c < m->shadowCascades; ++c) {
         cmd.setViewport(size * static_cast<f32>(c), 0.0f, size, size);
         const Frustum frustum = Frustum::fromViewProj(m->shadowViewProj[c]);
         const auto& buckets = list.buckets();
-        for (size_t mesh = 0; mesh < buckets.size() && mesh < m->meshes.size(); ++mesh) {
-            if (buckets[mesh].empty()) continue;
-            const BoundingSphere b = m->meshes[mesh].bounds;
-            visible.clear();
-            for (const InstanceData& inst : buckets[mesh]) {
-                const Vec3 s = inst.scale;
-                const f32 scale = std::max({std::abs(s.x), std::abs(s.y), std::abs(s.z)});
-                const Vec3 center = inst.position + rotate(inst.rotation, Vec3{b.center.x * s.x, b.center.y * s.y, b.center.z * s.z});
-                if (frustum.sphereVisible(center, b.radius * scale)) visible.push_back(inst);
-            }
+        const size_t meshCount = std::min(buckets.size(), m->meshes.size());
+        cullInstances(buckets, meshCount, frustum, [&](size_t mesh) { return m->meshes[mesh].bounds; }, m->shadowCull);
+        for (size_t mesh = 0; mesh < meshCount; ++mesh) {
+            const std::vector<InstanceData>& visible = m->shadowCull.visible[mesh];
             if (visible.empty()) continue;
             const u64 bytes = visible.size() * sizeof(InstanceData);
             u64 offset = 0;
