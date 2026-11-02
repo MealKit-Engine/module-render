@@ -125,7 +125,47 @@ struct ForwardPush {
     u32 lightOffset = 0; // ring offset of 8 point light indices per instance (8 bytes, 0xFF = end) (read only when the frame has lights)
     u32 paletteOffset = 0; // skinned meshes: ring offset of the palette (48 bytes per joint)
     u32 pad[2] = {};
+    f32 boxCenter[4] = {}; // mesh draws: quantization box (GpuVertex position = center + snorm * extent)
+    f32 boxExtent[4] = {};
 };
+
+// GPU vertex (24 bytes, 32 with SkinWeights): Vertex quantized at upload. The CPU Vertex (36 bytes) stays as is
+// (asset caches, physics hull points), so only the GPU copy loses precision
+struct GpuVertex {
+    i16 position[4]; // snorm in the mesh box (w = 0)
+    i16 normal[2];   // octahedral snorm
+    u32 color;
+    u32 uv;
+    u16 material;
+    u16 reserved;
+};
+static_assert(sizeof(GpuVertex) == 24);
+constexpr u32 kGpuSkinnedVertexStride = sizeof(GpuVertex) + sizeof(SkinWeights);
+
+i16 toSnorm16(f32 v) { return static_cast<i16>(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767.0f)); }
+
+GpuVertex quantize(const Vertex& v, Vec3 center, Vec3 invExtent) {
+    GpuVertex g{};
+    const Vec3 p = v.position - center;
+    g.position[0] = toSnorm16(p.x * invExtent.x);
+    g.position[1] = toSnorm16(p.y * invExtent.y);
+    g.position[2] = toSnorm16(p.z * invExtent.z);
+    // Octahedral normal: project onto the octahedron, fold the lower half over (decoded in Forward.hlsl decodeOctahedral)
+    Vec3 n = v.normal;
+    const f32 l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+    n = l1 > 0.0f ? n * (1.0f / l1) : Vec3{0.0f, 1.0f, 0.0f};
+    f32 ox = n.x, oy = n.y;
+    if (n.z < 0.0f) {
+        ox = (1.0f - std::abs(n.y)) * (n.x >= 0.0f ? 1.0f : -1.0f);
+        oy = (1.0f - std::abs(n.x)) * (n.y >= 0.0f ? 1.0f : -1.0f);
+    }
+    g.normal[0] = toSnorm16(ox);
+    g.normal[1] = toSnorm16(oy);
+    g.color = v.color;
+    g.uv = v.uv;
+    g.material = v.material;
+    return g;
+}
 
 struct UiPush {
     f32 screenSize[2] = {};
@@ -188,16 +228,22 @@ struct GpuMesh {
     u32 indexCount = 0;
     BoundingSphere bounds;
     bool outline = false; // at least one outline material: drawn once more with the outline pass
-    bool skinned = false; // 44-byte vertices (Vertex + SkinWeights), drawn with the skin pipeline
+    bool skinned = false; // 32-byte vertices (GpuVertex + SkinWeights), drawn with the skin pipeline
     bool alphaClip = false; // an alpha mask or dissolve material (discard turns off early depth: DrawList draws it last)
+    Vec3 boxCenter, boxExtent; // GpuVertex position quantization box (ForwardPush)
+    u32 stride() const { return skinned ? kGpuSkinnedVertexStride : sizeof(GpuVertex); }
+    void setBox(ForwardPush& push) const {
+        push.boxCenter[0] = boxCenter.x, push.boxCenter[1] = boxCenter.y, push.boxCenter[2] = boxCenter.z;
+        push.boxExtent[0] = boxExtent.x, push.boxExtent[1] = boxExtent.y, push.boxExtent[2] = boxExtent.z;
+    }
 };
 
-// Skin pipeline: the same desc with the vertex shader (SKINNED=1) and two joint attributes, 44-byte vertex stride
+// Skin pipeline: the same desc with the vertex shader (SKINNED=1) and two joint attributes, 32-byte vertex stride
 rhi::PipelineDesc skinnedDesc(rhi::PipelineDesc d, rhi::ShaderCode vs) {
     d.vs = vs;
-    d.vertexAttributes.push_back({"JOINTS", rhi::VertexFormat::Uint8x4, sizeof(Vertex)});
-    d.vertexAttributes.push_back({"WEIGHTS", rhi::VertexFormat::Unorm8x4, sizeof(Vertex) + 4});
-    d.vertexStride = kSkinnedVertexStride;
+    d.vertexAttributes.push_back({"JOINTS", rhi::VertexFormat::Uint8x4, sizeof(GpuVertex)});
+    d.vertexAttributes.push_back({"WEIGHTS", rhi::VertexFormat::Unorm8x4, sizeof(GpuVertex) + 4});
+    d.vertexStride = kGpuSkinnedVertexStride;
     return d;
 }
 
@@ -456,12 +502,12 @@ bool Renderer::init(const RendererDesc& desc) {
     // Style presets: all three lighting models + the outline pipeline are built here (once during loading, so no unseen combination appears during play)
     rhi::PipelineDesc forward;
     forward.vs = {g_ForwardVS, sizeof(g_ForwardVS)};
-    forward.vertexAttributes = {{"POSITION", rhi::VertexFormat::Float3, 0},
-                                {"NORMAL", rhi::VertexFormat::Float3, 12},
-                                {"COLOR", rhi::VertexFormat::Unorm8x4, 24},
-                                {"TEXCOORD", rhi::VertexFormat::Half2, 28},
-                                {"MATERIAL", rhi::VertexFormat::Uint16x2, 32}};
-    forward.vertexStride = sizeof(Vertex);
+    forward.vertexAttributes = {{"POSITION", rhi::VertexFormat::Snorm16x4, 0},
+                                {"NORMAL", rhi::VertexFormat::Snorm16x2, 8},
+                                {"COLOR", rhi::VertexFormat::Unorm8x4, 12},
+                                {"TEXCOORD", rhi::VertexFormat::Half2, 16},
+                                {"MATERIAL", rhi::VertexFormat::Uint16x2, 20}};
+    forward.vertexStride = sizeof(GpuVertex);
     forward.target = rhi::Target::Scene;
     for (u32 i = 0; i < kLightingModelCount; ++i) {
         m->forwardDesc[i] = forward;
@@ -666,17 +712,27 @@ MeshId Renderer::createMesh(const MeshData& data) {
     }
     GpuMesh mesh;
     mesh.skinned = data.skin.size() == data.vertices.size();
-    if (mesh.skinned) { // 44-byte vertices with SkinWeights appended after Vertex
-        std::vector<u8> interleaved(data.vertices.size() * kSkinnedVertexStride);
-        for (size_t i = 0; i < data.vertices.size(); ++i) {
-            std::memcpy(&interleaved[i * kSkinnedVertexStride], &data.vertices[i], sizeof(Vertex));
-            std::memcpy(&interleaved[i * kSkinnedVertexStride + sizeof(Vertex)], &data.skin[i], sizeof(SkinWeights));
-        }
-        mesh.vertexBuffer = m->device.createBuffer(rhi::BufferUsage::Vertex, interleaved.data(), interleaved.size());
-    } else {
-        mesh.vertexBuffer =
-            m->device.createBuffer(rhi::BufferUsage::Vertex, data.vertices.data(), data.vertices.size() * sizeof(Vertex));
+    // Quantization box: the vertices' axis-aligned bounds (a flat axis gets extent 1 so it doesn't divide by zero)
+    Vec3 lo = data.vertices[0].position, hi = lo;
+    for (const Vertex& v : data.vertices) {
+        const Vec3 p = v.position;
+        lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+        hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
     }
+    mesh.boxCenter = (lo + hi) * 0.5f;
+    mesh.boxExtent = (hi - lo) * 0.5f;
+    for (f32* e : {&mesh.boxExtent.x, &mesh.boxExtent.y, &mesh.boxExtent.z})
+        if (*e <= 0.0f) *e = 1.0f;
+    const Vec3 invExtent{1.0f / mesh.boxExtent.x, 1.0f / mesh.boxExtent.y, 1.0f / mesh.boxExtent.z};
+    // GpuVertex, with SkinWeights appended for skinned meshes
+    const u32 stride = mesh.stride();
+    std::vector<u8> packed(data.vertices.size() * stride);
+    for (size_t i = 0; i < data.vertices.size(); ++i) {
+        const GpuVertex g = quantize(data.vertices[i], mesh.boxCenter, invExtent);
+        std::memcpy(&packed[i * stride], &g, sizeof(GpuVertex));
+        if (mesh.skinned) std::memcpy(&packed[i * stride + sizeof(GpuVertex)], &data.skin[i], sizeof(SkinWeights));
+    }
+    mesh.vertexBuffer = m->device.createBuffer(rhi::BufferUsage::Vertex, packed.data(), packed.size());
     // With few vertices, shrink to 16-bit indices to save memory bandwidth (important on integrated graphics)
     if (data.vertices.size() <= 0xFFFF) {
         const std::vector<u16> shortIndices(data.indices.begin(), data.indices.end());
@@ -880,9 +936,10 @@ void Renderer::drawShadows(const DrawList& list) {
             std::memcpy(cpu, visible.data(), bytes);
             const GpuMesh& gm = m->meshes[mesh];
             if (gm.skinned) continue; // skinned meshes below together with palettes
-            const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(offset), 0, 0};
+            ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(offset), 0, 0};
+            gm.setBox(push);
             cmd.pushConstants(&push, sizeof(push));
-            cmd.setVertexBuffer(gm.vertexBuffer, sizeof(Vertex));
+            cmd.setVertexBuffer(gm.vertexBuffer, gm.stride());
             cmd.setIndexBuffer(gm.indexBuffer);
             cmd.drawIndexed(gm.indexCount, static_cast<u32>(visible.size()));
             m->stats.drawCalls += 1;
@@ -910,8 +967,9 @@ void Renderer::drawShadows(const DrawList& list) {
             if (!skinBound) cmd.setPipeline(m->shadowSkin), skinBound = true;
             ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->shadowFrameOffsets[c]), static_cast<u32>(instanceOffset), 0, 0};
             push.paletteOffset = static_cast<u32>(paletteOffset);
+            gm.setBox(push);
             cmd.pushConstants(&push, sizeof(push));
-            cmd.setVertexBuffer(gm.vertexBuffer, kSkinnedVertexStride);
+            cmd.setVertexBuffer(gm.vertexBuffer, gm.stride());
             cmd.setIndexBuffer(gm.indexBuffer);
             cmd.drawIndexed(gm.indexCount, 1);
             m->stats.drawCalls += 1;
@@ -1399,9 +1457,10 @@ void Renderer::Impl::drawMesh(MeshId meshId, const InstanceData* instances, u32 
     ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), static_cast<u32>(offset),
                      static_cast<u32>(debugView), static_cast<u32>(lightOffset)};
     push.paletteOffset = paletteOffset;
+    mesh.setBox(push);
     if (mesh.skinned) cmd.setPipeline(scenePipeline(true));
     cmd.pushConstants(&push, sizeof(push));
-    cmd.setVertexBuffer(mesh.vertexBuffer, mesh.skinned ? kSkinnedVertexStride : sizeof(Vertex));
+    cmd.setVertexBuffer(mesh.vertexBuffer, mesh.stride());
     cmd.setIndexBuffer(mesh.indexBuffer);
     cmd.drawIndexed(mesh.indexCount, count);
     stats.drawCalls += 1;
