@@ -231,6 +231,7 @@ struct RendererDesc {
     bool vsync = true;
     bool debugLayer = false;
     bool gpuCapture = false; // --gpu-capture (rhi/GpuCapture.h)
+    std::string pipelineCache; // rhi::DeviceDesc::pipelineCache (user folder; empty = off)
 };
 
 // GPU inspection is done by the RHI backend (shipping exe --system-info, min-spec check)
