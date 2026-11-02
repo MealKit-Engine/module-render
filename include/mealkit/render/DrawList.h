@@ -93,11 +93,29 @@ public:
         renderer.drawShadows(*this); // shadow maps first (before binding the main view)
         const Frustum& frustum = renderer.frustum();
         cullInstances(m_buckets, m_buckets.size(), frustum, [&](size_t mesh) { return renderer.meshBounds(static_cast<MeshId>(mesh)); }, m_cull);
+        // Front to back so early depth rejects hidden pixels (overdraw is the main pixel cost on integrated graphics):
+        // buckets by their nearest visible instance, alpha clip buckets last (discard turns off early depth),
+        // and instances inside small buckets by distance too (large ones like scatter grass stay in add order)
+        const Vec3 eye = renderer.cameraPos();
+        m_order.clear();
         for (size_t mesh = 0; mesh < m_buckets.size(); ++mesh) {
-            const auto& visible = m_cull.visible[mesh];
+            auto& visible = m_cull.visible[mesh];
             renderer.addCulled(static_cast<u32>(m_buckets[mesh].size() - visible.size()));
-            if (!visible.empty())
-                renderer.drawInstances(static_cast<MeshId>(mesh), visible.data(), static_cast<u32>(visible.size()));
+            if (visible.empty()) continue;
+            const auto dist2 = [&](const InstanceData& inst) { return lengthSq(inst.position - eye); };
+            if (visible.size() <= kSortedBucketMax)
+                std::sort(visible.begin(), visible.end(),
+                          [&](const InstanceData& a, const InstanceData& b) { return dist2(a) < dist2(b); });
+            f32 nearest = dist2(visible[0]);
+            for (const InstanceData& inst : visible) nearest = std::min(nearest, dist2(inst));
+            m_order.push_back({renderer.meshAlphaClip(static_cast<MeshId>(mesh)), nearest, static_cast<u32>(mesh)});
+        }
+        std::sort(m_order.begin(), m_order.end(), [](const Order& a, const Order& b) {
+            return a.alphaClip != b.alphaClip ? b.alphaClip : a.dist2 != b.dist2 ? a.dist2 < b.dist2 : a.mesh < b.mesh;
+        });
+        for (const Order& o : m_order) {
+            const auto& visible = m_cull.visible[o.mesh];
+            renderer.drawInstances(static_cast<MeshId>(o.mesh), visible.data(), static_cast<u32>(visible.size()));
         }
         for (const SkinnedItem& item : m_skinned) {
             const BoundingSphere b = renderer.meshBounds(item.mesh);
@@ -122,6 +140,13 @@ private:
     std::vector<BoneMatrix> m_bones;
     std::vector<Particle> m_particles;
     mutable CullScratch m_cull; // submit's culling buffers (reused between frames)
+    struct Order {
+        bool alphaClip;
+        f32 dist2; // nearest visible instance
+        u32 mesh;
+    };
+    mutable std::vector<Order> m_order; // submit's bucket draw order (reused between frames)
+    static constexpr size_t kSortedBucketMax = 256; // const-ok: buckets up to this many visible instances are sorted inside too
 };
 
 } // namespace mealkit::render

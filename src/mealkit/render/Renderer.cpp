@@ -189,6 +189,7 @@ struct GpuMesh {
     BoundingSphere bounds;
     bool outline = false; // at least one outline material: drawn once more with the outline pass
     bool skinned = false; // 44-byte vertices (Vertex + SkinWeights), drawn with the skin pipeline
+    bool alphaClip = false; // an alpha mask or dissolve material (discard turns off early depth: DrawList draws it last)
 };
 
 // Skin pipeline: the same desc with the vertex shader (SKINNED=1) and two joint attributes, 44-byte vertex stride
@@ -317,6 +318,7 @@ struct Renderer::Impl {
     bool uploadOverflowWarned = false;
     RenderStats stats;
     Frustum frustum;
+    Vec3 cameraPos; // this frame's (beginFrame)
     i32 openPass = -1; // pass whose GPU time is being measured now (GpuPass, -1 if none)
     std::string capturePath;
 
@@ -688,11 +690,12 @@ MeshId Renderer::createMesh(const MeshData& data) {
     std::vector<Vec3> points(data.vertices.size());
     for (size_t i = 0; i < points.size(); ++i) points[i] = data.vertices[i].position;
     mesh.bounds = boundingSphere(points.data(), points.size());
-    for (const Vertex& v : data.vertices)
-        if (v.material < m->materials.size() && (m->materials[v.material].features & kMaterialOutline)) {
-            mesh.outline = true;
-            break;
-        }
+    for (const Vertex& v : data.vertices) {
+        if (v.material >= m->materials.size()) continue;
+        const MaterialGpu& mat = m->materials[v.material];
+        mesh.outline |= (mat.features & kMaterialOutline) != 0;
+        mesh.alphaClip |= mat.alphaCutoff > 0.0f || (mat.features & kMaterialDissolve) != 0;
+    }
     m->meshes.push_back(mesh);
     return static_cast<MeshId>(m->meshes.size() - 1);
 }
@@ -754,6 +757,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
 
     m->stats = {};
     m->frustum = Frustum::fromViewProj(p.viewProj);
+    m->cameraPos = p.cameraPos;
     const rhi::GpuTimes& gpu = m->device.gpuTimes();
     m->stats.gpuValid = gpu.valid;
     m->stats.gpuFrameMs = gpu.frameMs;
@@ -1291,6 +1295,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     m->lighting = lighting;
     m->writeFrameConstants(p, &m->frameOffset, false); // offscreen without shadows (lookdev, reflection probe baking)
     m->frustum = Frustum::fromViewProj(p.viewProj);
+    m->cameraPos = p.cameraPos;
 
     const Vec3 sky = p.fogColor;
     const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
@@ -1556,6 +1561,8 @@ const RenderStats& Renderer::stats() const {
 BoundingSphere Renderer::meshBounds(MeshId mesh) const {
     return m && mesh < m->meshes.size() ? m->meshes[mesh].bounds : BoundingSphere{};
 }
+bool Renderer::meshAlphaClip(MeshId mesh) const { return m && mesh < m->meshes.size() && m->meshes[mesh].alphaClip; }
+Vec3 Renderer::cameraPos() const { return m ? m->cameraPos : Vec3{}; }
 const Frustum& Renderer::frustum() const {
     static const Frustum none; // with no planes everything is visible
     return m ? m->frustum : none;

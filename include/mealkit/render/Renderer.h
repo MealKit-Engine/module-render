@@ -300,6 +300,9 @@ public:
     u32 createTexture(const rhi::TextureInit& init);
     // Mesh local bounding sphere (createMesh computes it from vertices). Radius 0 for missing meshes
     BoundingSphere meshBounds(MeshId mesh) const;
+    // An alpha mask or dissolve material in the mesh (DrawList::submit draws these buckets last)
+    bool meshAlphaClip(MeshId mesh) const;
+    Vec3 cameraPos() const; // this frame's FrameParams::cameraPos (front-to-back order)
     // Frustum of this frame's viewProj (made by beginFrame). DrawList::submit filters instances with it
     const Frustum& frustum() const;
     void addCulled(u32 count); // for stats (DrawList::submit)
