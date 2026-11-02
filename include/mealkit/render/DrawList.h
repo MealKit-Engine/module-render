@@ -71,6 +71,7 @@ public:
 
     // Skinned meshes (characters): the palette is copied (asset::skinPalette). Drawn one at a time, not batched per mesh
     void addSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount) {
+        if (mesh == kNoMesh) return;
         m_skinned.push_back({mesh, instance, static_cast<u32>(m_bones.size()), boneCount});
         m_bones.insert(m_bones.end(), bones, bones + boneCount);
     }
@@ -85,6 +86,7 @@ public:
     static constexpr f32 kSkinnedBoundsScale = 1.5f;
 
     void add(MeshId mesh, const InstanceData& instance) {
+        if (mesh == kNoMesh) return;
         if (mesh >= m_buckets.size()) m_buckets.resize(mesh + 1);
         m_buckets[mesh].push_back(instance);
     }

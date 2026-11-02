@@ -16,6 +16,7 @@ namespace mealkit::render {
 
 class DrawList;
 using MeshId = u32;
+inline constexpr MeshId kNoMesh = 0xFFFFFFFFu; // not drawn (asset::ModelCache::pickLod below the cull size)
 
 // Materials (supported range of glTF PBR metallic-roughness, docs/CODING_MODEL.md "Models, materials, textures"). The renderer keeps them in a table
 // and writes it to the upload ring every frame (shaders/Forward.hlsl Material, 64 bytes). Textures are bindless indices (kNoTexture = none)
