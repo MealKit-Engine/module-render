@@ -148,6 +148,7 @@ inline constexpr u32 kMaxShadowCascades = 2;
 // View values, unrelated to determinism. The scene is drawn in HDR (linear) and one uber pass tone maps it to the back buffer
 struct PostParams {
     bool toneMapping = true; // false: linear values are only clamped to sRGB (reflection probe baking). Bloom/LUT/effects are off too
+    bool punchy = true;      // AgX "Punchy" look: more contrast and saturation than the flat base look
     f32 exposure = 0.0f;     // EV (2x = +1)
     u32 lut = 0;             // color grading LUT (createLut index, 0 = none)
     f32 bloomIntensity = 0.25f; // 0 = skip the bloom pass
@@ -189,10 +190,10 @@ struct FrameParams {
     Vec3 cameraForward{0.0f, 0.0f, 1.0f}; // sound listener direction (the engine passes it to audio::Engine::setListener every frame)
     Vec3 sunDirection{0.4f, 0.8f, 0.3f}; // direction toward the sun (the renderer normalizes it)
     Vec3 sunColor{1.0f, 0.95f, 0.85f};
-    Vec3 skyColor{0.30f, 0.38f, 0.50f}; // linear color space
+    Vec3 skyColor{0.18f, 0.36f, 0.85f}; // linear color space; without an environment also the sky overhead
     Vec3 groundColor{0.20f, 0.17f, 0.14f};
-    Vec3 fogColor{0.50f, 0.62f, 0.78f}; // also used as the background clear color
-    f32 fogDensity = 0.008f;
+    Vec3 fogColor{0.55f, 0.70f, 0.95f}; // also the background clear color and, without an environment, the sky at the horizon
+    f32 fogDensity = 0.003f;
     // Blends the whole screen toward this color (linear) (flash from the feedback table, filled by the engine from feedback::Player). 0 = none
     Vec3 tintColor{1.0f, 1.0f, 1.0f};
     f32 tintAmount = 0.0f;

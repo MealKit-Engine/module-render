@@ -197,7 +197,7 @@ struct PostConstants {
     f32 sceneSize[4];
 };
 static_assert(sizeof(PostConstants) == 96);
-constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u, kPostSharpen = 8u; // Post.hlsl kPost*
+constexpr u32 kPostToneMap = 1u, kPostFxaa = 2u, kPostDither = 4u, kPostSharpen = 8u, kPostPunchy = 16u; // Post.hlsl kPost*
 constexpr u32 kLutWidth = kLutSize * kLutSize; // 32³ as a horizontal strip 1024 × 32 (32 cells per blue slice)
 
 // Color blindness correction (Fidaner-style daltonize): simulates the colors that person sees from linear RGB with Machado 2009 (severity 1.0),
@@ -334,7 +334,7 @@ struct Renderer::Impl {
     void ensureScene();
     rhi::RenderTarget captureSource;       // captureTarget (this endFrame)
     Image* captureOut = nullptr;
-    void drawSky(const FrameParams& p); // after writing frame constants, before 3D (does nothing without an environment)
+    void drawSky(const FrameParams& p); // after writing frame constants, before 3D (sky HDRI, or the fog → sky color gradient)
     LightingModel lighting = LightingModel::Pbr;
     DebugView debugView = DebugView::None;
     // Shader hot reload swaps only the bytecode and rebuilds. The VS of every forwardDesc[n] is the same
@@ -1065,8 +1065,7 @@ void Renderer::Impl::writeFrameConstants(const FrameParams& p, u64* offset, bool
 }
 
 void Renderer::Impl::drawSky(const FrameParams& p) {
-    if (!p.environment || p.environment > environments.size()) return;
-    rhi::CommandList& cmd = device.cmd();
+    rhi::CommandList& cmd = device.cmd(); // without an environment the shader draws the fog → sky color gradient
     cmd.setPipeline(sky);
     const ForwardPush push{device.uploadBufferIndex(), static_cast<u32>(frameOffset), 0, 0, 0};
     cmd.pushConstants(&push, sizeof(push));
@@ -1237,7 +1236,8 @@ void Renderer::Impl::runPost(PostChain& chain, const PostParams& post, const f32
     const f32 effects[4] = {postOptions.filmGrain ? std::clamp(post.grain, 0.0f, 1.0f) : 0.0f,
                             postOptions.chromaticAberration ? std::clamp(post.chromaticAberration, 0.0f, 0.1f) : 0.0f,
                             std::fmod(time, 64.0f), std::clamp(resolution.sharpness, 0.0f, 1.0f)};
-    const u32 flags = (tone ? kPostToneMap | kPostDither | (postOptions.antiAliasing ? kPostFxaa : 0u) : 0u) | (sharpen ? kPostSharpen : 0u);
+    const u32 flags = (tone ? kPostToneMap | kPostDither | (postOptions.antiAliasing ? kPostFxaa : 0u) | (post.punchy ? kPostPunchy : 0u) : 0u) |
+                      (sharpen ? kPostSharpen : 0u);
     const u32 postTextures[4] = {bloomReady ? device.textureIndex(device.renderTargetTexture(chain.bloom[0])) : kNoTexture,
                              tone && (lut != 0 || postOptions.colorBlind != ColorBlindMode::Off) ? device.textureIndex(luts[lut].texture)
                                                                                                  : kNoTexture,
