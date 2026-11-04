@@ -14,14 +14,13 @@ namespace mealkit::editor {
 
 class LookdevPanel {
 public:
-    static constexpr const char* kWindow = "Look Dev###LookDev";
     // Model to show (model of the object selected in the scene; only a hint if empty)
     void setModel(const std::string& path) { m_model = path; }
     const std::string& model() const { return m_model; }
     // After drawing 3D, before UI (only when the window is open). The target is created on the first call
     void render(render::Renderer& renderer, asset::ModelCache& models, render::LightingModel projectLighting, f64 dt);
     // ImGui window (inside Editor::renderUi)
-    void draw(render::Renderer& renderer, bool* open);
+    void drawContent(render::Renderer& renderer);
     // For automated capture (--lookdev): lighting index (HDRI list after the color presets), lighting model index (-1 = project setting)
     void setPreset(u32 preset) { m_preset = preset; }
     void setLighting(i32 lighting) { m_lighting = lighting; }

@@ -90,12 +90,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
     renderer.drawToTarget(m_target, frame, m_drawList, lighting);
 }
 
-void LookdevPanel::draw(render::Renderer& renderer, bool* open) {
-    ImGui::SetNextWindowSize(ImVec2(420, 520), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(trl(kWindow), open)) {
-        ImGui::End();
-        return;
-    }
+void LookdevPanel::drawContent(render::Renderer& renderer) {
     const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
     if (ImGui::BeginCombo(tr("Light"), hdri ? m_hdris[m_preset - kPresetCount].c_str() : presetName(m_preset))) {
         if (ImGui::IsWindowAppearing()) m_hdris = asset::listHdris(asset::ModelCache::assetsRoot()); // newly added HDRIs
@@ -140,7 +135,6 @@ void LookdevPanel::draw(render::Renderer& renderer, bool* open) {
             if (wheel != 0.0f) m_zoom = std::clamp(m_zoom * (wheel > 0.0f ? 1.1f : 1.0f / 1.1f), 0.5f, 3.0f);
         }
     }
-    ImGui::End();
 }
 
 } // namespace mealkit::editor
