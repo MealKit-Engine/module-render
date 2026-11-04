@@ -1,4 +1,5 @@
 #include "mealkit/editor/LookdevPanel.h"
+#include "mealkit/editor/FieldEditor.h"
 
 #include "mealkit/editor/Strings.h"
 
@@ -92,7 +93,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
 
 void LookdevPanel::drawContent(render::Renderer& renderer) {
     const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
-    if (ImGui::BeginCombo(tr("Light"), hdri ? m_hdris[m_preset - kPresetCount].c_str() : presetName(m_preset))) {
+    if (beginCombo(tr("Light"), hdri ? m_hdris[m_preset - kPresetCount].c_str() : presetName(m_preset))) {
         if (ImGui::IsWindowAppearing()) m_hdris = asset::listHdris(asset::ModelCache::assetsRoot()); // newly added HDRIs
         for (u32 i = 0; i < kPresetCount; ++i)
             if (ImGui::Selectable(presetName(i), m_preset == i)) m_preset = i;
