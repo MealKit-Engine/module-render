@@ -2,6 +2,7 @@
 #include "mealkit/editor/FieldEditor.h"
 
 #include "mealkit/editor/Strings.h"
+#include "mealkit/render/Environment.h"
 
 #include <algorithm>
 #include <cmath>
@@ -47,7 +48,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
     const asset::Model* model = m_model.empty() ? nullptr : models.get(m_model);
     m_hasModel = model != nullptr;
     if (!m_hdrisListed) {
-        m_hdris = asset::listHdris(asset::ModelCache::assetsRoot());
+        m_hdris = render::listHdris(asset::ModelCache::assetsRoot());
         m_hdrisListed = true;
     }
     const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
@@ -94,7 +95,7 @@ void LookdevPanel::render(render::Renderer& renderer, asset::ModelCache& models,
 void LookdevPanel::drawContent(render::Renderer& renderer) {
     const bool hdri = m_preset >= kPresetCount && m_preset - kPresetCount < m_hdris.size();
     if (beginCombo(tr("Light"), hdri ? m_hdris[m_preset - kPresetCount].c_str() : presetName(m_preset))) {
-        if (ImGui::IsWindowAppearing()) m_hdris = asset::listHdris(asset::ModelCache::assetsRoot()); // newly added HDRIs
+        if (ImGui::IsWindowAppearing()) m_hdris = render::listHdris(asset::ModelCache::assetsRoot()); // newly added HDRIs
         for (u32 i = 0; i < kPresetCount; ++i)
             if (ImGui::Selectable(presetName(i), m_preset == i)) m_preset = i;
         if (!m_hdris.empty()) ImGui::Separator();

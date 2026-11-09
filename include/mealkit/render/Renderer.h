@@ -15,46 +15,20 @@ struct Image;
 namespace mealkit::render {
 
 class DrawList;
-using MeshId = u32;
-inline constexpr MeshId kNoMesh = 0xFFFFFFFFu; // not drawn (asset::ModelCache::pickLod below the cull size)
-
-// Materials (supported range of glTF PBR metallic-roughness, docs/CODING_MODEL.md "Models, materials, textures"). The renderer keeps them in a table
-// and writes it to the upload ring every frame (shaders/Forward.hlsl Material, 64 bytes). Textures are bindless indices (kNoTexture = none)
-inline constexpr u32 kNoTexture = 0xFFFFFFFFu;
+// Mesh, material and texture data are the asset module's (asset/MeshData.h)
+using asset::kMaterialDissolve;
+using asset::kMaterialOutline;
+using asset::kMaterialRim;
+using asset::kMaterialWind;
+using asset::kNoMesh;
+using asset::kNoTexture;
+using asset::MaterialData;
+using asset::MeshId;
 
 // Lighting model (style preset, docs/CODING_MODEL.md "Shader code"): the single project setting lightingModel decides it for the whole game.
 // One shader per model is compiled at build time, and the renderer builds all pipelines in init (switching doesn't hitch)
 enum class LightingModel : u8 { Pbr, Toon, Unlit }; // same order as the project setting game::LightingModelSetting
 inline constexpr u32 kLightingModelCount = 3;
-
-// Material features (glTF extras "mealkit_<key>", materialFeatures in asset::modelSchemaJson). Not shader variants but
-// chosen inside the shader by material table bits: even if materials with different features mix in one mesh, it's still one draw call
-inline constexpr u32 kMaterialOutline = 1u;  // outline: inverted hull pass (if any material in a mesh has it, that mesh is drawn once more)
-inline constexpr u32 kMaterialWind = 2u;     // wind sway: strength is painted in vertex color alpha (1 for models without alpha)
-inline constexpr u32 kMaterialRim = 4u;      // rim light: edges get brighter
-inline constexpr u32 kMaterialDissolve = 8u; // dissolve: disappears by the instance's dissolve progress (instanceDissolve)
-
-struct MaterialData {
-    f32 baseColor[4] = {1, 1, 1, 1}; // linear
-    f32 emissive[3] = {0, 0, 0};
-    f32 metallic = 0.0f;
-    f32 roughness = 1.0f;
-    f32 normalScale = 1.0f;
-    f32 alphaCutoff = 0.0f; // > 0 means alpha mask (alpha below this isn't drawn)
-    u32 baseColorTexture = kNoTexture;
-    u32 normalTexture = kNoTexture;
-    u32 metallicRoughnessTexture = kNoTexture; // G = roughness, B = metal (glTF)
-    u32 emissiveTexture = kNoTexture;
-    // Style preset material features (kMaterial* bits and values). Colors are linear
-    u32 features = 0;
-    f32 outlineWidth = 0.02f; // meters (world units, independent of instance scale)
-    f32 outlineColor[3] = {0, 0, 0};
-    f32 windStrength = 0.1f;  // meters (sway amplitude at vertex alpha 1 and FrameParams::windStrength 1)
-    f32 rimStrength = 0.5f;
-    f32 rimColor[3] = {1, 1, 1};
-    f32 dissolveEdge = 0.05f; // glowing width of the disappearing edge (in progress units 0..1)
-    f32 dissolveColor[3] = {4.0f, 1.6f, 0.4f}; // edge emission (linear, brighter above 1)
-};
 
 // Instance data copied to the GPU as is (48 bytes, identical to the HLSL Instance struct).
 struct InstanceData {
@@ -115,7 +89,7 @@ struct Viewport {
     f32 x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
 };
 
-// One reflection probe (a scene reflection_probe object, filled by asset::ModelCache::probes). An object uses the reflection cube of the one probe
+// One reflection probe (a scene reflection_probe object, filled by render::probes (render/ModelDraw.h)). An object uses the reflection cube of the one probe
 // whose influence box contains its position with the closest center (no blending). If in no box, the sky HDRI reflection
 struct ReflectionProbe {
     Vec3 position;     // baked position = influence box center
@@ -216,7 +190,7 @@ struct FrameParams {
     PostParams post; // not used in view modes (colors as is)
 };
 
-// Environment baked from a sky HDRI (asset::EnvironmentMap, cubes in RGB9E5, faces +X −X +Y −Y +Z −Z in order). createEnvironment uploads it to the GPU
+// Environment baked from a sky HDRI (render::EnvironmentMap, cubes in RGB9E5, faces +X −X +Y −Y +Z −Z in order). createEnvironment uploads it to the GPU
 struct EnvironmentData {
     f32 sh[9][3] = {}; // ambient color = Σ sh[i] · Y_i(n)
     u32 skySize = 0;
@@ -299,7 +273,7 @@ public:
     void replaceMesh(MeshId id, const MeshData& mesh);
     // Referenced by vertex material indices. Index 0 is default white (created by init)
     u32 createMaterial(const MaterialData& material);
-    // Texture with mips (asset::TextureCache). The bindless index read by shaders
+    // Texture with mips (render/TextureCache.h). The bindless index read by shaders
     u32 createTexture(const rhi::TextureInit& init);
     // Mesh local bounding sphere (createMesh computes it from vertices). Radius 0 for missing meshes
     BoundingSphere meshBounds(MeshId mesh) const;
@@ -312,7 +286,7 @@ public:
 
     // Uploads a sky HDRI environment to the GPU and returns an index (FrameParams::environment). Not deleted: the user (ModelCache) reuses the index for the same HDRI
     u32 createEnvironment(const EnvironmentData& data);
-    // Uploads a reflection probe cube (asset::ProbeMap: RGB9E5, per face from mip 0) and returns an index (ReflectionProbe::id). Not deleted
+    // Uploads a reflection probe cube (render::ProbeMap: RGB9E5, per face from mip 0) and returns an index (ReflectionProbe::id). Not deleted
     u32 createProbe(u32 size, u32 mips, const u32* reflect);
     // Lighting model (project setting, game::applyRenderStyle). All pipelines are prebuilt by init, so it switches immediately
     void setLightingModel(LightingModel model);
@@ -337,7 +311,7 @@ public:
     bool meshSkinned(MeshId mesh) const;
     // Particles (DrawList::submit calls it after opaque 3D): one draw call, GPU pass Vfx
     void drawParticles(const Particle* particles, u32 count);
-    // Color grading LUT (asset::loadCubeLut): rgb sRGB values of kLutSize³ cells (red changes fastest). The index is PostParams::lut.
+    // Color grading LUT (render::loadCubeLut): rgb sRGB values of kLutSize³ cells (red changes fastest). The index is PostParams::lut.
     // Not deleted: the user (ModelCache) reuses the index for the same file
     u32 createLut(const f32* rgb);
     void setPostOptions(const PostOptions& options); // player settings (rebuilds LUTs when color blindness correction changes)
