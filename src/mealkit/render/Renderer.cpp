@@ -27,6 +27,8 @@
 #include "g_SkyVS.h"
 #include "g_ParticlePS.h"
 #include "g_ParticleVS.h"
+#include "g_SpritePS.h"
+#include "g_SpriteVS.h"
 #include "g_BloomDownPS.h"
 #include "g_BloomUpPS.h"
 #include "g_PostVS.h"
@@ -261,6 +263,8 @@ struct Renderer::Impl {
     rhi::Pipeline ui;
     rhi::Pipeline particles; // shaders/Particle.hlsl (after opaque 3D, no depth writes)
     rhi::PipelineDesc particleDesc;
+    rhi::Pipeline sprites; // shaders/Sprite.hlsl (after opaque 3D, before particles, no depth writes)
+    rhi::PipelineDesc spriteDesc;
     rhi::Pipeline sky; // skybox (fullscreen triangle, before 3D without depth)
     rhi::PipelineDesc skyDesc;
     struct Environment {
@@ -365,6 +369,7 @@ struct Renderer::Impl {
     RenderStats stats;
     Frustum frustum;
     Vec3 cameraPos; // this frame's (beginFrame)
+    Vec3 cameraForward{0.0f, 0.0f, 1.0f};
     i32 openPass = -1; // pass whose GPU time is being measured now (GpuPass, -1 if none)
     std::string capturePath;
 
@@ -419,6 +424,7 @@ struct Renderer::Impl {
             {"Forward.hlsl", &shadowSkin, &shadowSkinDesc, "VSShadow", "PSShadow", "SKINNED=1"},
             {"Forward.hlsl", &sky, &skyDesc, "VSSky", "PSSky", ""},
             {"Particle.hlsl", &particles, &particleDesc, "VSMain", "PSMain", ""},
+            {"Sprite.hlsl", &sprites, &spriteDesc, "VSMain", "PSMain", ""},
             {"Ui.hlsl", &ui, &uiDesc, "VSMain", "PSMain", ""},
             {"Post.hlsl", &bloomDown, &bloomDownDesc, "VSMain", "PSBloomDown", ""},
             {"Post.hlsl", &bloomUp, &bloomUpDesc, "VSMain", "PSBloomUp", ""},
@@ -569,6 +575,11 @@ bool Renderer::init(const RendererDesc& desc) {
     particles.depthWrite = false;
     m->particleDesc = particles;
     m->particles = m->device.createPipeline(particles);
+    rhi::PipelineDesc sprites = particles; // same state: scene target, both faces, premultiplied blend, depth test without writes
+    sprites.vs = {g_SpriteVS, sizeof(g_SpriteVS)};
+    sprites.ps = {g_SpritePS, sizeof(g_SpritePS)};
+    m->spriteDesc = sprites;
+    m->sprites = m->device.createPipeline(sprites);
     // Post: fullscreen triangle (no vertex buffer/depth). The bloom chain is HDR, the uber pass targets the back buffer/Ldr targets
     rhi::PipelineDesc post;
     post.vs = {g_PostVS, sizeof(g_PostVS)};
@@ -814,6 +825,7 @@ bool Renderer::beginFrame(const FrameParams& p) {
     m->stats = {};
     m->frustum = Frustum::fromViewProj(p.viewProj);
     m->cameraPos = p.cameraPos;
+    m->cameraForward = p.cameraForward;
     const rhi::GpuTimes& gpu = m->device.gpuTimes();
     m->stats.gpuValid = gpu.valid;
     m->stats.gpuFrameMs = gpu.frameMs;
@@ -1354,6 +1366,7 @@ void Renderer::drawToTarget(rhi::RenderTarget target, const FrameParams& p, cons
     m->writeFrameConstants(p, &m->frameOffset, false); // offscreen without shadows (lookdev, reflection probe baking)
     m->frustum = Frustum::fromViewProj(p.viewProj);
     m->cameraPos = p.cameraPos;
+    m->cameraForward = p.cameraForward;
 
     const Vec3 sky = p.fogColor;
     const f32 clear[4] = {sky.x, sky.y, sky.z, 1.0f};
@@ -1499,6 +1512,28 @@ void Renderer::drawParticles(const Particle* particles, u32 count) {
     m->stats.drawCalls += 1; // the Vfx section lasts until beginOverlay (UI) (particles are last in DrawList::submit)
 }
 
+void Renderer::drawSprites(const Sprite* sprites, u32 count) {
+    if (!m || !m->inFrame || !sprites || count == 0) return;
+    m->ensureScene();
+    count = std::min(count, kMaxSpritesPerFrame);
+    const u64 bytes = static_cast<u64>(count) * sizeof(Sprite);
+    u64 offset = 0;
+    u8* cpu = m->device.allocUpload(bytes, kRingAlignment, &offset);
+    if (!cpu) {
+        m->warnOverflow(bytes);
+        return;
+    }
+    std::memcpy(cpu, sprites, bytes);
+    rhi::CommandList& cmd = m->device.cmd();
+    if (m->openPass == static_cast<i32>(GpuPass::Opaque)) m->beginPass(GpuPass::Vfx);
+    cmd.setPipeline(m->sprites);
+    const ForwardPush push{m->device.uploadBufferIndex(), static_cast<u32>(m->frameOffset), static_cast<u32>(offset), 0, 0};
+    cmd.pushConstants(&push, sizeof(push));
+    cmd.draw(6, count);
+    cmd.setPipeline(m->scenePipeline());
+    m->stats.drawCalls += 1;
+}
+
 void Renderer::beginOverlay() {
     if (!m || !m->inFrame) return;
     m->ensureScene();
@@ -1622,6 +1657,7 @@ BoundingSphere Renderer::meshBounds(MeshId mesh) const {
 }
 bool Renderer::meshAlphaClip(MeshId mesh) const { return m && mesh < m->meshes.size() && m->meshes[mesh].alphaClip; }
 Vec3 Renderer::cameraPos() const { return m ? m->cameraPos : Vec3{}; }
+Vec3 Renderer::cameraForward() const { return m ? m->cameraForward : Vec3{0.0f, 0.0f, 1.0f}; }
 const Frustum& Renderer::frustum() const {
     static const Frustum none; // with no planes everything is visible
     return m ? m->frustum : none;

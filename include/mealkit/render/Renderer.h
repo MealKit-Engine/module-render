@@ -84,6 +84,27 @@ static_assert(sizeof(Particle) == 32, "Particle must match the HLSL layout");
 inline constexpr u32 kParticleAdditive = 1u;
 inline constexpr u32 kMaxParticlesPerFrame = 16384; // beyond this, from the front (upload ring 512 KB)
 
+// One sprite (64 bytes like HLSL Sprite, shaders/Sprite.hlsl): a textured quad in the world on the plane of its rotation
+// (identity = facing -z, the 2D camera's view). Drawn after opaque 3D and before particles, depth tested without writes,
+// back to front (DrawList::submit sorts by layer, then distance). The texture holds premultiplied alpha (render/Sprites.h).
+struct Sprite {
+    Vec3 position;           // where the pivot lands
+    u32 texture = 0;         // bindless index from SpriteTextures (render/Sprites.h)
+    Quat rotation;           // the quad's x/y plane
+    f32 width = 1.0f, height = 1.0f; // meters
+    f32 pivotX = 0.5f, pivotY = 0.5f; // 0..1 from the image's left/bottom
+    f32 u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f; // image rect (v down from the top), for sheet cells
+    u32 color = 0xFFFFFFFF;  // tint, sRGB RGBA8 (rgba()), straight alpha
+    u32 flags = 0;           // kSprite*
+    i32 layer = 0;           // draw order before distance: higher layers draw over lower ones
+    f32 pad = 0.0f;
+};
+static_assert(sizeof(Sprite) == 80, "Sprite must match the HLSL layout");
+inline constexpr u32 kSpriteFlipX = 1u;
+inline constexpr u32 kSpriteFlipY = 2u;
+inline constexpr u32 kSpritePoint = 4u; // nearest texel (pixel art) instead of linear filtering
+inline constexpr u32 kMaxSpritesPerFrame = 8192; // beyond this, the last in draw order are dropped (640 KB of the upload ring)
+
 // Screen area (pixels) to draw 3D in. Whole window if width is 0.
 struct Viewport {
     f32 x = 0.0f, y = 0.0f, width = 0.0f, height = 0.0f;
@@ -280,6 +301,7 @@ public:
     // An alpha mask or dissolve material in the mesh (DrawList::submit draws these buckets last)
     bool meshAlphaClip(MeshId mesh) const;
     Vec3 cameraPos() const; // this frame's FrameParams::cameraPos (front-to-back order)
+    Vec3 cameraForward() const; // this frame's FrameParams::cameraForward (sprite back-to-front order)
     // Frustum of this frame's viewProj (made by beginFrame). DrawList::submit filters instances with it
     const Frustum& frustum() const;
     void addCulled(u32 count); // for stats (DrawList::submit)
@@ -311,6 +333,8 @@ public:
     bool meshSkinned(MeshId mesh) const;
     // Particles (DrawList::submit calls it after opaque 3D): one draw call, GPU pass Vfx
     void drawParticles(const Particle* particles, u32 count);
+    // Sprites in draw order (DrawList::submit sorts them and calls this after opaque 3D, before particles): one draw call, GPU pass Vfx
+    void drawSprites(const Sprite* sprites, u32 count);
     // Color grading LUT (render::loadCubeLut): rgb sRGB values of kLutSize³ cells (red changes fastest). The index is PostParams::lut.
     // Not deleted: the user (ModelCache) reuses the index for the same file
     u32 createLut(const f32* rgb);

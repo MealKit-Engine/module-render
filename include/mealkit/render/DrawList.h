@@ -63,11 +63,16 @@ public:
         m_skinned.clear();
         m_bones.clear();
         m_particles.clear();
+        m_sprites.clear();
     }
 
     // Particles (feedback::Player::addParticles): drawn all at once after opaque 3D
     void addParticles(const Particle* particles, size_t count) { m_particles.insert(m_particles.end(), particles, particles + count); }
     const std::vector<Particle>& particles() const { return m_particles; }
+
+    // Sprites (render::Sprite, render/Sprites.h addSprite): drawn after opaque 3D, before particles, by layer then back to front
+    void addSprite(const Sprite& sprite) { m_sprites.push_back(sprite); }
+    const std::vector<Sprite>& sprites() const { return m_sprites; }
 
     // Skinned meshes (characters): the palette is copied (asset::skinPalette). Drawn one at a time, not batched per mesh
     void addSkinned(MeshId mesh, const InstanceData& instance, const BoneMatrix* bones, u32 boneCount) {
@@ -130,6 +135,7 @@ public:
             else
                 renderer.addCulled(1);
         }
+        if (!m_sprites.empty()) submitSprites(renderer, frustum);
         if (!m_particles.empty()) renderer.drawParticles(m_particles.data(), static_cast<u32>(m_particles.size()));
     }
 
@@ -137,6 +143,28 @@ public:
     const std::vector<std::vector<InstanceData>>& buckets() const { return m_buckets; }
 
 private:
+    // Visible sprites by layer, then farthest first along the view (stable: equal ones keep their add order)
+    void submitSprites(Renderer& renderer, const Frustum& frustum) const {
+        const Vec3 eye = renderer.cameraPos();
+        const Vec3 forward = renderer.cameraForward();
+        m_spriteOrder.clear();
+        for (const Sprite& sp : m_sprites) {
+            const f32 radius = std::sqrt(sp.width * sp.width + sp.height * sp.height); // covers any pivot
+            if (!frustum.sphereVisible(sp.position, radius)) {
+                renderer.addCulled(1);
+                continue;
+            }
+            m_spriteOrder.push_back(sp);
+        }
+        std::stable_sort(m_spriteOrder.begin(), m_spriteOrder.end(), [&](const Sprite& a, const Sprite& b) {
+            if (a.layer != b.layer) return a.layer < b.layer;
+            return dot(a.position - eye, forward) > dot(b.position - eye, forward);
+        });
+        renderer.drawSprites(m_spriteOrder.data(), static_cast<u32>(m_spriteOrder.size()));
+    }
+
+    std::vector<Sprite> m_sprites;
+    mutable std::vector<Sprite> m_spriteOrder; // submit's visible sprites in draw order (reused between frames)
     std::vector<std::vector<InstanceData>> m_buckets;
     std::vector<SkinnedItem> m_skinned;
     std::vector<BoneMatrix> m_bones;

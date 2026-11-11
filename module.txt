@@ -7,6 +7,6 @@ version 0.2.0
 engine 0.9
 kind view
 layer framework
-requires asset 0.2 rhi 0.1 scene 0.1
+requires asset 0.2 rhi 0.1 scene 0.2
 tags render
-summary Renderer (forward pipeline, lights, shadows, post, particles), model drawing, texture cache, sky HDRI
+summary Renderer (forward pipeline, lights, shadows, post, particles, sprites), model drawing, texture cache, sky HDRI
