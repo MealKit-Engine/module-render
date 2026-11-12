@@ -3,10 +3,10 @@
 @format module 1
 type engine
 name render
-version 0.3.0
+version 0.3.1
 engine 0.9
 kind view
 layer framework
-requires asset 0.2 rhi 0.1 scene 0.2
+requires asset 0.2 rhi 0.2 scene 0.2
 tags render
 summary Renderer (forward pipeline, lights, shadows, post, particles, sprites), model drawing, texture cache, sky HDRI

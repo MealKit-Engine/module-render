@@ -5,6 +5,7 @@
 #include "mealkit/platform/Image.h"
 #include "mealkit/render/DrawList.h"
 #include "mealkit/render/ShaderReload.h"
+#include "mealkit/rhi/GpuCapture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -503,7 +504,15 @@ bool Renderer::init(const RendererDesc& desc) {
     m = new Impl();
     jobs::acquire(); // culling workers (shared with physics); released in shutdown
     m->vsync = desc.vsync;
-    if (!m->device.init({desc.window, desc.width, desc.height, desc.debugLayer, desc.gpuCapture, desc.pipelineCache})) return false;
+    rhi::connectLog();
+    rhi::DeviceDesc deviceDesc;
+    deviceDesc.window = desc.window;
+    deviceDesc.width = desc.width;
+    deviceDesc.height = desc.height;
+    deviceDesc.debug = desc.debugLayer;
+    if (desc.gpuCapture) deviceDesc.beforeDeviceCreate = &rhi::loadGpuCaptureTool;
+    deviceDesc.pipelineCache = desc.pipelineCache;
+    if (!m->device.init(deviceDesc)) return false;
 
     // Style presets: all three lighting models + the outline pipeline are built here (once during loading, so no unseen combination appears during play)
     rhi::PipelineDesc forward;
