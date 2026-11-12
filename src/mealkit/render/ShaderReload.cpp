@@ -16,7 +16,7 @@ namespace mealkit::render {
 
 namespace {
 constexpr f64 kCheckSeconds = 0.5;         // interval for checking file times
-const char* const kProfiles[2] = {"vs_6_6", "ps_6_6"}; // same as mealkit_shader in CMakeLists
+const char* const kProfiles[2] = {"vs_6_6", "ps_6_6"}; // same as mkrender_shader in MkRender's CMakeLists.txt
 } // namespace
 
 struct ShaderReloader::Impl {
@@ -52,7 +52,7 @@ struct ShaderReloader::Impl {
         // ChildProcess wraps it in cmd.exe /s /c "..."
         const Program& p = programs[job];
         const std::string define = p.defines.empty() ? std::string() : " -D " + p.defines;
-        // SPIR-V (Vulkan builds) renames entry points to VSMain/PSMain (same as mealkit_shader in CMakeLists)
+        // SPIR-V (Vulkan builds) renames entry points to VSMain/PSMain (same as mkrender_shader in MkRender's CMakeLists.txt)
         const std::string flags = MEALKIT_SHADER_HOT_FLAGS;
         const std::string entryName =
             flags.find("-spirv") != std::string::npos ? std::string(" -fspv-entrypoint-name=") + (stage == 0 ? "VSMain" : "PSMain") : "";

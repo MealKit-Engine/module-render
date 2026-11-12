@@ -3,10 +3,10 @@
 @format module 1
 type engine
 name render
-version 0.3.1
+version 0.4.0
 engine 0.9
 kind view
 layer framework
 requires asset 0.2 rhi 0.2 scene 0.2
 tags render
-summary Renderer (forward pipeline, lights, shadows, post, particles, sprites), model drawing, texture cache, sky HDRI
+summary Glue for mkrender (MkRender): render::Renderer with jobs, capture, hot reload and screenshots; model drawing, texture cache, sky HDRI, sprites
