@@ -116,7 +116,7 @@ void LookdevPanel::drawContent(render::Renderer& renderer) {
     ImGui::SetNextItemWidth(120.0f);
     ImGui::SliderFloat(tr("Dissolve"), &m_dissolve, 0.0f, 1.0f, "%.2f");
 
-    if (m_model.empty()) ImGui::TextDisabled("%s", tr("Select an object with a model in the scene."));
+    if (m_model.empty()) ImGui::TextDisabled("%s", tr("Pick a model in [Assets]."));
     else if (!m_hasModel) ImGui::TextDisabled("%s", trf("Cannot load %s", m_model.c_str()).c_str());
     else ImGui::TextDisabled("%s", m_model.c_str());
 
