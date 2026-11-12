@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mealkit/core/Math.h"
+#include "mkrender/Bake.h"
 
 #include <string>
 #include <vector>
@@ -16,13 +17,9 @@
 // View-only, so unrelated to the simulation and content hash.
 namespace mealkit::render {
 
-struct EnvironmentMap {
-    f32 sh[9][3] = {}; // ambient color = Σ sh[i] · Y_i(n) (Y: real spherical harmonics orders 0~2)
-    u32 skySize = 0;   // sky cube face size (one mip)
-    std::vector<u32> sky;
-    u32 reflectSize = 0, reflectMips = 0; // reflection cube (per face starting from mip 0)
-    std::vector<u32> reflect;
-};
+// The baking itself is MkRender's mkbake (mkrender/Bake.h), shared with the MkRender scene editor: same cache and probe bytes
+using mkrender::EnvironmentMap;
+using mkrender::ProbeMap;
 
 // hdrPath (.hdr file) → read from cache, or if missing (dev build) bake and write to cache. On failure, false and a reason.
 // A path ending in .mkenv (asset/Cooked.h, the cook step) is read as a cache file directly
@@ -48,21 +45,17 @@ std::string environmentCacheFile(const std::string& hdrPath);
 // Reflection probes (docs/ROADMAP.md stage 2 "Reflection probes"): at a scene reflection_probe object's position, the editor renders the scene to six cube faces
 // and reads them back (editor/ProbeBaker), and they're baked here into a reflection cube + GGX mips. Files are assets/probes/<scene>_<object id>.mkprobe (committed:
 // shipping reads these files without baking). Same layout as the sky HDRI reflection cube (RGB9E5, per face starting from mip 0)
-struct ProbeMap {
-    u32 size = 0, mips = 0;
-    std::vector<u32> reflect;
-};
-// faces: six faces (+X −X +Y −Y +Z −Z, cubeDirection orientation) × faceSize² × linear rgb. Size is faceSize, mips down to 4
-void bakeProbe(const f32* faces, u32 faceSize, ProbeMap& out);
+using mkrender::cubeFaceForward; // the camera of cube face i (lookAtLH(eye, eye + forward, up), 90 degrees)
+using mkrender::cubeFaceUp;
+using mkrender::bakeProbe; // faces: six faces (+X -X +Y -Y +Z -Z, cubeDirection orientation) x faceSize^2 x linear rgb. Size is faceSize, mips down to 4
 bool saveProbe(const std::string& path, const ProbeMap& probe);
 bool loadProbe(const std::string& path, ProbeMap& out, std::string& error);
 
 // --- Baking parts (unit tests)
-u32 packRgb9e5(f32 r, f32 g, f32 b); // negatives become 0, overly large values the max
-void unpackRgb9e5(u32 v, f32 out[3]);
-Vec3 cubeDirection(u32 face, f32 s, f32 t); // face 0..5, s/t = −1..1 (texel center) → normalized direction
-// Bake from an equirectangular image (rgb float, width × height) (no file/cache)
-void bakeEnvironment(const f32* rgb, u32 width, u32 height, EnvironmentMap& out);
-Vec3 evalSh(const f32 (&sh)[9][3], Vec3 n); // same computation as the shader
+using mkrender::bakeEnvironment; // from an equirectangular image (rgb float, width x height), no file/cache
+using mkrender::cubeDirection;
+using mkrender::evalSh;
+using mkrender::packRgb9e5;
+using mkrender::unpackRgb9e5;
 
 } // namespace mealkit::render
