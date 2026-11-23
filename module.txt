@@ -3,10 +3,10 @@
 @format module 1
 type engine
 name render
-version 0.5.1
+version 0.6.0
 engine 0.9
 kind view
 layer framework
-requires asset 0.2 rhi 0.2 scene 0.2
+requires asset 0.2 data 0.1 rhi 0.2 scene 0.3 sim 0.1
 tags render
 summary Glue for mkrender (MkRender): render::Renderer with jobs, capture, hot reload and screenshots; model drawing, texture cache, sky HDRI, probes and LUT files (baked by mkbake), sprites

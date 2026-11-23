@@ -1,6 +1,7 @@
 #include "mealkit/render/Sprites.h"
 
 #include "mealkit/core/Log.h"
+#include "mealkit/data/Tables.h"
 #include "mealkit/platform/Paths.h"
 
 #include <algorithm>
@@ -101,6 +102,42 @@ const SpriteTextures::Texture& SpriteTextures::get(const std::string& assetPath)
     return entry.texture;
 }
 
+bool SpriteClips::load() {
+    m_path = findAsset(std::string("assets/") + kSpriteClipTable);
+    m_time = m_path.empty() ? 0 : fileWriteTime(m_path);
+    m_table = {};
+    if (!m_path.empty()) data::loadTable(m_table, kSpriteClipTable);
+    return !m_path.empty();
+}
+
+bool SpriteClips::poll(f64 dt) {
+    m_check -= dt;
+    if (m_check > 0.0) return false;
+    m_check = 0.25;
+    const std::string path = findAsset(std::string("assets/") + kSpriteClipTable);
+    const unsigned long long t = path.empty() ? 0 : fileWriteTime(path);
+    if (path == m_path && t == m_time) return false;
+    load();
+    MEALKIT_INFO("Sprites: %u clip(s) from %s", count(), path.empty() ? "(no sprite_clips.table)" : path.c_str());
+    return true;
+}
+
+const SpriteClip* SpriteClips::find(std::string_view name) const {
+    const u32 row = m_table.find(name);
+    return row == kNoRow ? nullptr : &m_table[row];
+}
+
+u32 SpriteClips::frameAt(const SpriteClip& clip, f64 seconds) {
+    const i64 frames = std::max<i64>(clip.frames, 1);
+    if (!(seconds > 0.0) || !(clip.fps > 0.0f)) return 0;
+    const i64 step = static_cast<i64>(std::floor(seconds * static_cast<f64>(clip.fps)));
+    return static_cast<u32>(clip.loop ? step % frames : std::min(step, frames - 1));
+}
+
+u32 SpriteClips::cellAt(const SpriteClip& clip, f64 seconds) {
+    return static_cast<u32>(std::max(clip.firstCell, 0)) + frameAt(clip, seconds);
+}
+
 void spriteCell(Sprite& out, u32 columns, u32 rows, u32 cell) {
     columns = std::max(columns, 1u);
     rows = std::max(rows, 1u);
@@ -112,8 +149,17 @@ void spriteCell(Sprite& out, u32 columns, u32 rows, u32 cell) {
     out.v1 = out.v0 + ch;
 }
 
-void addSprite(DrawList& out, SpriteTextures& textures, const scene::Entity& e, const scene::Transform& world) {
-    const scene::SpriteFields f = scene::readObject<scene::SpriteFields>(e);
+void addSprite(DrawList& out, SpriteTextures& textures, const scene::Entity& e, const scene::Transform& world, const SpriteAnim* anim) {
+    scene::SpriteFields f = scene::readObject<scene::SpriteFields>(e);
+    if (anim && anim->clips) { // a clip (the view's choice, else the object's) replaces image, sheet and cell; an unknown name keeps the object's own
+        const std::string_view name = anim->clip.empty() ? std::string_view(f.clip) : anim->clip;
+        if (const SpriteClip* clip = name.empty() ? nullptr : anim->clips->find(name)) {
+            f.image = clip->image;
+            f.columns = clip->columns;
+            f.rows = clip->rows;
+            f.cell = static_cast<i32>(SpriteClips::cellAt(*clip, anim->time - anim->start));
+        }
+    }
     const SpriteTextures::Texture& tex = textures.get(f.image);
     Sprite s;
     s.position = world.position;
