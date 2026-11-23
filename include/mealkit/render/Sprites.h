@@ -79,6 +79,17 @@ struct SpriteAnim {
     f64 start = 0.0;
 };
 
+// Pixel snapping for an orthographic 2D camera (docs/DECISIONS.md 2026-11-23 "Pixel snapping"). Makes every art pixel cover a
+// whole number of screen pixels (zoom = screen pixels per art pixel, at least 1, rounded from the requested halfHeight) and puts the
+// center on the screen-pixel grid so sprites don't shimmer while the camera moves. pixelsPerUnit <= 0 or a viewport without height
+// returns the request unchanged. Sprite positions aren't touched. View only.
+struct PixelView {
+    Vec2 center;
+    f32 halfHeight = 1.0f;
+    u32 zoom = 1; // screen pixels per art pixel (0 when snapping is off)
+};
+PixelView snapPixelView(Vec2 center, f32 halfHeight, f32 viewportHeightPixels, f32 pixelsPerUnit);
+
 // Fills a sprite for the image rect of one sheet cell (columns x rows, cell counted from the top left) and its pixel size
 void spriteCell(Sprite& out, u32 columns, u32 rows, u32 cell);
 

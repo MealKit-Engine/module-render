@@ -138,6 +138,19 @@ u32 SpriteClips::cellAt(const SpriteClip& clip, f64 seconds) {
     return static_cast<u32>(std::max(clip.firstCell, 0)) + frameAt(clip, seconds);
 }
 
+PixelView snapPixelView(Vec2 center, f32 halfHeight, f32 viewportHeightPixels, f32 pixelsPerUnit) {
+    PixelView out{center, halfHeight, 0};
+    if (!(pixelsPerUnit > 0.0f) || !(viewportHeightPixels >= 1.0f) || !(halfHeight > 0.0f)) return out;
+    const f32 requested = viewportHeightPixels / (2.0f * halfHeight * pixelsPerUnit); // screen pixels per art pixel as asked
+    const f32 zoom = std::max(1.0f, std::floor(requested + 0.5f));
+    out.zoom = static_cast<u32>(zoom);
+    out.halfHeight = viewportHeightPixels / (2.0f * pixelsPerUnit * zoom);
+    const f32 step = 1.0f / (pixelsPerUnit * zoom); // one screen pixel in meters
+    out.center.x = std::floor(center.x / step + 0.5f) * step;
+    out.center.y = std::floor(center.y / step + 0.5f) * step;
+    return out;
+}
+
 void spriteCell(Sprite& out, u32 columns, u32 rows, u32 cell) {
     columns = std::max(columns, 1u);
     rows = std::max(rows, 1u);
