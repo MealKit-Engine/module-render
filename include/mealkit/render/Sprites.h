@@ -97,4 +97,15 @@ void spriteCell(Sprite& out, u32 columns, u32 rows, u32 cell);
 // object's color as tint. flags is added to the sprite's (none defined for highlight yet)
 void addSprite(DrawList& out, SpriteTextures& textures, const scene::Entity& e, const scene::Transform& world, const SpriteAnim* anim = nullptr);
 
+// World rectangle the camera sees (x/y, meters); tilemaps skip cells outside it. View only
+struct TileView {
+    f32 minX = -1e30f, minY = -1e30f, maxX = 1e30f, maxY = 1e30f;
+};
+
+// One tilemap scene object (fields TilemapFields; docs/DECISIONS.md 2026-11-24 "Tilemaps are one scene object"): every non-empty cell becomes
+// a sprite of the sheet cell, all with one texture so they batch into one or two draws. Cells outside `view` (if given) are skipped, which
+// keeps a big map under kMaxSpritesPerFrame. world.position is the grid's bottom left corner (rotation and scale are ignored, like the collision);
+// the object's color tints every cell
+void addTilemap(DrawList& out, SpriteTextures& textures, const scene::Entity& e, const scene::Transform& world, const TileView* view = nullptr);
+
 } // namespace mealkit::render

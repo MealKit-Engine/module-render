@@ -195,4 +195,40 @@ void addSprite(DrawList& out, SpriteTextures& textures, const scene::Entity& e, 
     out.addSprite(s);
 }
 
+void addTilemap(DrawList& out, SpriteTextures& textures, const scene::Entity& e, const scene::Transform& world, const TileView* view) {
+    const scene::TilemapFields f = scene::readObject<scene::TilemapFields>(e);
+    const std::vector<i32> tiles = scene::parseTileCells(f.cells, f.width, f.height);
+    if (f.width <= 0 || tiles.empty() || !(f.cellSize > 0.0f)) return;
+    const i32 width = f.width, height = static_cast<i32>(tiles.size() / static_cast<size_t>(width));
+    const SpriteTextures::Texture& tex = textures.get(f.image);
+    const u32 columns = static_cast<u32>(std::max(f.columns, 1)), rows = static_cast<u32>(std::max(f.rows, 1));
+    // Cell ranges the view touches
+    i32 c0 = 0, c1 = width - 1, r0 = 0, r1 = height - 1;
+    if (view) {
+        const f32 cs = f.cellSize;
+        c0 = std::max(c0, static_cast<i32>(std::floor((view->minX - world.position.x) / cs)));
+        c1 = std::min(c1, static_cast<i32>(std::floor((view->maxX - world.position.x) / cs)));
+        r0 = std::max(r0, static_cast<i32>(std::floor(static_cast<f32>(height) - (view->maxY - world.position.y) / cs)));
+        r1 = std::min(r1, static_cast<i32>(std::floor(static_cast<f32>(height) - (view->minY - world.position.y) / cs)));
+    }
+    for (i32 r = r0; r <= r1; ++r) {
+        for (i32 c = c0; c <= c1; ++c) {
+            const i32 tile = tiles[static_cast<size_t>(r) * static_cast<size_t>(width) + static_cast<size_t>(c)];
+            if (tile < 0) continue;
+            Sprite s;
+            s.position = {world.position.x + static_cast<f32>(c) * f.cellSize, world.position.y + static_cast<f32>(height - 1 - r) * f.cellSize, world.position.z};
+            s.texture = tex.index;
+            spriteCell(s, columns, rows, static_cast<u32>(tile));
+            s.width = f.cellSize;
+            s.height = f.cellSize;
+            s.pivotX = 0.0f; // the cell's bottom left corner
+            s.pivotY = 0.0f;
+            s.color = e.color;
+            s.layer = f.layer;
+            s.flags = f.pixelArt ? kSpritePoint : 0u;
+            out.addSprite(s);
+        }
+    }
+}
+
 } // namespace mealkit::render
