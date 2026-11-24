@@ -21,9 +21,15 @@ public:
     void render(render::Renderer& renderer, asset::ModelCache& models, render::LightingModel projectLighting, f64 dt);
     // ImGui window (inside Editor::renderUi)
     void drawContent(render::Renderer& renderer);
+    // [Materials] page (T4): read-only list of the shown model's materials; the selected row's triangles are tinted in the image
+    void drawMaterials();
+    void drawView();
+    void drawImage(render::Renderer& renderer);
     // For automated capture (--lookdev): lighting index (HDRI list after the color presets), lighting model index (-1 = project setting)
     void setPreset(u32 preset) { m_preset = preset; }
     void setLighting(i32 lighting) { m_lighting = lighting; }
+    // --lookdev-material <n>: open the [Materials] page with the n-th material of the model selected (its triangles tinted)
+    void selectMaterial(i32 index) { m_material = index; m_openMaterials = true; }
 
 private:
     rhi::RenderTarget m_target;
@@ -40,6 +46,10 @@ private:
     f32 m_flash = 0.0f;
     f32 m_dissolve = 0.0f;
     bool m_hasModel = false; // the last render found a model
+    const std::vector<asset::MaterialInfo>* m_info = nullptr; // the shown model's materials (set by render(), valid for this frame's UI)
+    i32 m_material = -1;     // selected row on the [Materials] page (-1 = none): tinted in the image
+    bool m_materialsShown = false; // the [Materials] page was drawn last frame
+    bool m_openMaterials = false; // select the [Materials] tab on the next draw (--lookdev-material)
 };
 
 } // namespace mealkit::editor
