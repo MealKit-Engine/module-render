@@ -30,6 +30,14 @@ public:
     void setLighting(i32 lighting) { m_lighting = lighting; }
     // --lookdev-material <n>: open the [Materials] page with the n-th material of the model selected (its triangles tinted)
     void selectMaterial(i32 index) { m_material = index; m_openMaterials = true; }
+    // Pixel inspector (docs/ROADMAP.md technical artist T2): while on, the left button over the image reads the pixel under it (dragging keeps reading)
+    // instead of turning the stand. The editor's scene view shares this switch (View Mode list), so one switch covers both views.
+    // pixelAsked() is true when the last read came from this image (so its result is not shown in the scene view); forgetPixel() is called when the scene view reads
+    bool pixelInspect() const { return m_pixelInspect; }
+    void setPixelInspect(bool on) { m_pixelInspect = on; }
+    bool pixelAsked() const { return m_pixelAsked; }
+    void forgetPixel() { m_pixelAsked = false; }
+    void setPixelAuto(i32 x, i32 y) { m_pixelInspect = true, m_pixelAutoX = x, m_pixelAutoY = y; } // --lookdev-pixel x,y: reads that image pixel every frame
 
 private:
     rhi::RenderTarget m_target;
@@ -50,6 +58,13 @@ private:
     i32 m_material = -1;     // selected row on the [Materials] page (-1 = none): tinted in the image
     bool m_materialsShown = false; // the [Materials] page was drawn last frame
     bool m_openMaterials = false; // select the [Materials] tab on the next draw (--lookdev-material)
+    bool m_pixelInspect = false;
+    bool m_pixelAsked = false;
+    i32 m_pixelAutoX = -1, m_pixelAutoY = -1;
 };
+
+// What Renderer::pixelInspect() holds, as text rows: the HDR color before post, after exposure, its luminance and the color on screen,
+// or a hint while nothing has been read. The editor's scene view draws the same rows in a small window
+void drawPixelReadout(const render::PixelInspect& px);
 
 } // namespace mealkit::editor

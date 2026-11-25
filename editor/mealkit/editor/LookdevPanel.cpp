@@ -1,5 +1,6 @@
 #include "mealkit/editor/LookdevPanel.h"
 #include "mealkit/editor/FieldEditor.h"
+#include "mealkit/editor/ImGuiLayer.h"
 
 #include "mealkit/editor/Strings.h"
 #include "mealkit/render/Environment.h"
@@ -147,6 +148,9 @@ void LookdevPanel::drawView() {
     if (ImGui::Combo(tr("Lighting model"), &lighting, lightingNames, static_cast<int>(std::size(lightingNames)))) m_lighting = lighting - 1;
     ImGui::Checkbox(tr("Turn"), &m_spin);
     ImGui::SameLine();
+    checkbox(tr("Pixel Inspector"), &m_pixelInspect);
+    ImGui::SetItemTooltip("%s", tr("Click the view to read a pixel: HDR value, luminance and final color"));
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(120.0f);
     ImGui::SliderFloat(tr("Zoom"), &m_zoom, 0.5f, 3.0f, "%.2f");
     ImGui::SetNextItemWidth(120.0f);
@@ -213,15 +217,49 @@ void LookdevPanel::drawMaterials() {
     ImGui::TextDisabled("%s", tr("Values are changed in Blender."));
 }
 
+void drawPixelReadout(const render::PixelInspect& px) {
+    if (!px.valid) {
+        ImGui::TextDisabled("%s", tr("Click the view to read a pixel: HDR value, luminance and final color"));
+        return;
+    }
+    const f32 e = px.exposure;
+    const f32 lum = 0.2126f * px.linear[0] + 0.7152f * px.linear[1] + 0.0722f * px.linear[2]; // Rec.709
+    ImGui::TextDisabled("%s (%u, %u)", tr("Pixel"), px.x, px.y);
+    const f32 h = ImGui::GetFrameHeight() * 2.0f;
+    ImGui::ColorButton("##pixelSwatch", ImVec4(px.srgb[0] / 255.0f, px.srgb[1] / 255.0f, px.srgb[2] / 255.0f, 1.0f),
+                       ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoAlpha, ImVec2(h, h));
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::Text("%s  %.4f  %.4f  %.4f", tr("HDR (linear)"), static_cast<f64>(px.linear[0]), static_cast<f64>(px.linear[1]), static_cast<f64>(px.linear[2]));
+    ImGui::Text("%s  %.4f  %.4f  %.4f", tr("After exposure"), static_cast<f64>(px.linear[0] * e), static_cast<f64>(px.linear[1] * e), static_cast<f64>(px.linear[2] * e));
+    ImGui::Text("%s  %.4f (%.4f)", tr("Luminance"), static_cast<f64>(lum), static_cast<f64>(lum * e));
+    ImGui::Text("%s  %u  %u  %u  #%02X%02X%02X", tr("Final sRGB"), px.srgb[0], px.srgb[1], px.srgb[2], px.srgb[0], px.srgb[1], px.srgb[2]);
+    ImGui::EndGroup();
+}
+
 void LookdevPanel::drawImage(render::Renderer& renderer) {
-    // Image: a square fitting the remaining space. Dragging rotates the stand and changes elevation
+    if (m_pixelInspect) drawPixelReadout(m_pixelAsked ? renderer.pixelInspect() : render::PixelInspect{}); // above the image: the image takes what is left
+    // Image: a square fitting the remaining space. Dragging rotates the stand and changes elevation (with the pixel inspector on, it reads pixels instead)
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const f32 side = std::max(64.0f, std::min(avail.x, avail.y));
     const rhi::Texture texture = renderer.renderTargetTexture(m_target);
     if (texture) {
         ImGui::Image(ImTextureRef(static_cast<ImTextureID>(rhi::imguiTextureId(renderer.device(), texture))), ImVec2(side, side));
+        const ImVec2 imageMin = ImGui::GetItemRectMin();
+        const auto read = [&](f32 px, f32 py) { // image pixels (the target is kTargetSize wide, shown at `side` points)
+            const f32 last = static_cast<f32>(kTargetSize - 1);
+            renderer.inspectPixel(static_cast<u32>(std::clamp(px, 0.0f, last)), static_cast<u32>(std::clamp(py, 0.0f, last)), m_target);
+            m_pixelAsked = true;
+        };
+        if (m_pixelInspect && m_pixelAutoX >= 0) read(static_cast<f32>(m_pixelAutoX), static_cast<f32>(m_pixelAutoY));
         if (ImGui::IsItemHovered()) {
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            if (m_pixelInspect) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    const ImVec2 mouse = ImGui::GetIO().MousePos;
+                    const f32 k = static_cast<f32>(kTargetSize) / side;
+                    read((mouse.x - imageMin.x) * k, (mouse.y - imageMin.y) * k);
+                }
+            } else if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 const ImVec2 d = ImGui::GetIO().MouseDelta;
                 m_yaw -= d.x * 0.01f;
                 m_pitch = std::clamp(m_pitch + d.y * 0.01f, -0.3f, 1.4f);
