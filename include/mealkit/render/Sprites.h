@@ -20,7 +20,9 @@ class SpriteTextures {
 public:
     struct Texture {
         u32 index = 0;          // bindless index (Sprite::texture)
-        u32 width = 0, height = 0; // pixels (0 for missing files, which draw white)
+        // Pixels (0 for missing files, which draw white). A PNG the browser cook halved (game/Cook.h) gives its original size
+        // from its mkSz chunk, so sprites sized from these keep their size on screen
+        u32 width = 0, height = 0;
     };
     explicit SpriteTextures(Renderer& renderer) : m_renderer(renderer) {}
     // Outside a frame or inside one before DrawList::submit. An empty path or a missing file gives the white texture

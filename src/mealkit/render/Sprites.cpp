@@ -31,6 +31,28 @@ u8 toSrgb(f32 c) {
 }
 
 // RGBA8 straight sRGB → mip chain of premultiplied linear-filtered pixels, encoded back to sRGB (alpha stays linear)
+// The size a PNG had before the browser cook halved it (game/Cook.h): chunk "mkSz" before IDAT, big-endian u32 width and height.
+// false without one
+bool originalSize(const std::string& png, u32& width, u32& height) {
+    const auto be32 = [&](size_t at) {
+        return static_cast<u32>(static_cast<u8>(png[at])) << 24 | static_cast<u32>(static_cast<u8>(png[at + 1])) << 16 |
+               static_cast<u32>(static_cast<u8>(png[at + 2])) << 8 | static_cast<u32>(static_cast<u8>(png[at + 3]));
+    };
+    for (size_t at = 8; at + 12 <= png.size();) {
+        const u32 length = be32(at);
+        if (png.compare(at + 4, 4, "IDAT") == 0 || at + 12 + static_cast<size_t>(length) > png.size()) return false;
+        if (length == 8 && png.compare(at + 4, 4, "mkSz") == 0) {
+            const u32 w = be32(at + 8), h = be32(at + 12);
+            if (!w || !h) return false;
+            width = w;
+            height = h;
+            return true;
+        }
+        at += 12 + static_cast<size_t>(length);
+    }
+    return false;
+}
+
 std::vector<u8> buildMips(const u8* rgba, u32 width, u32 height, u32& mipCount) {
     std::vector<f32> level(static_cast<size_t>(width) * height * 4);
     for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
@@ -99,6 +121,7 @@ const SpriteTextures::Texture& SpriteTextures::get(const std::string& assetPath)
     entry.texture.index = m_renderer.createTexture({static_cast<u32>(w), static_cast<u32>(h), mips, rhi::Format::Rgba8Srgb, data.data()});
     entry.texture.width = static_cast<u32>(w);
     entry.texture.height = static_cast<u32>(h);
+    originalSize(bytes, entry.texture.width, entry.texture.height);
     return entry.texture;
 }
 
